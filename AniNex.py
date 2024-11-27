@@ -5,7 +5,7 @@ app = Flask(__name__)
 CORS(app)
 @app.route('/')
 def home():
-    return jsonify(message="Hello from Flask!")
+    return jsonify(message="Hello from AniNex!")
 
 @app.route('/anime/<anime>/episode/<episode>/')
 def getDiscussion(anime, episode):

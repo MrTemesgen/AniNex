@@ -1,9 +1,11 @@
 from flask import Flask, jsonify
-CLIENT_ID = '172f90c7c272edd61b3161ef902cdb91'
 import requests
 from bs4 import BeautifulSoup
 import cydifflib
 import re
+from dotenv import load_dotenv
+import os
+CLIENT_ID = os.getenv('CLIENT_ID')
 
 def get_discussion(anime, episode):
     
