@@ -1,1 +1,1 @@
-"web: gunicorn AniNex:app" 
+"web: gunicorn app:app" 
