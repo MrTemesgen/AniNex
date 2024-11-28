@@ -1,4 +1,4 @@
-from flask import Flask, jsonify
+from flask import Flask, jsonify, current_app
 from GetDiscussion import get_discussion
 from flask_cors import CORS
 app = Flask(__name__)
@@ -12,4 +12,4 @@ def getDiscussion(anime, episode):
     return get_discussion(anime=anime, episode=episode)
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=False)
