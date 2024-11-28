@@ -1,4 +1,4 @@
-from flask import Flask, jsonify
+from flask import Flask, jsonify, current_app
 import requests
 from bs4 import BeautifulSoup
 import cydifflib
@@ -8,12 +8,13 @@ import os
 CLIENT_ID = os.getenv('CLIENT_ID')
 
 def get_discussion(anime, episode):
-    
+    current_app.logger.info(f"GET Discussion for {anime}-{episode}")
     anime_id = get_anime_id(anime)[1]
     discussion_id = get_discussion_link(anime, anime_id, episode)
     BASE_URL = f"https://api.myanimelist.net/v2/forum/topic/{discussion_id}?&limit=100"
-    discussion = requests.get(BASE_URL, headers = {'X-MAL-CLIENT-ID': f'{CLIENT_ID}'}).json()['data']
-    return jsonify(message = discussion)
+    discussion = requests.get(BASE_URL, headers = {'X-MAL-CLIENT-ID': f'{CLIENT_ID}'}).json()
+    data = discussion['data'] if 'data' in discussion else {}
+    return jsonify(message = data)
 
 def get_discussion_link(anime, id, episode):
     try:
@@ -30,7 +31,8 @@ def get_discussion_link(anime, id, episode):
         row = table.find_all('tr')[idx]
         link = row.find_all(['td', 'th'])[-1].find('a')['href']
         return re.findall('=(.*)', link)[0]
-    except:
+    except Exception as e:
+        current_app.logger.error(f"Exception getting Discussion link for {anime}-{episode}", e)
         None
 
 def get_anime_id(anime):
@@ -46,13 +48,7 @@ def get_anime_id(anime):
         closest_title = cydifflib.get_close_matches(anime, titles, n=1)[0]
         idx = titles.index(closest_title)
         return titles_ids[idx]
-    except:
+    except Exception as e:
+        current_app.logger.error(f"Exception getting anime id for {anime}", e)
         return titles_ids[0] if len(titles_ids) > 0 else None
-
-def get_forum_page(anime, episode):
-    
-    BASE_URL = "https://myanimelist.net/anime/918/{anime}/episode"
-    response = requests.get(url)
-    html_content = response.text
-
 
