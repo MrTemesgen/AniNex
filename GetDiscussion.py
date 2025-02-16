@@ -49,7 +49,7 @@ def get_discussion_link(anime, id, episode):
         None
 
 def get_anime_id(anime):
-    BASE_URL = f'https://api.myanimelist.net/v2/anime?q={anime}&limit=10'
+    BASE_URL = f'https://api.myanimelist.net/v2/anime?q={anime}&limit=100'
     data = requests.get(BASE_URL,  headers = {'X-MAL-CLIENT-ID': f'{CLIENT_ID}'}).json()
 
     if 'data' not in data:
