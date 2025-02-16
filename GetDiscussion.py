@@ -1,9 +1,10 @@
 from flask import Flask, jsonify, current_app
-import requests
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+from rapidfuzz import process
+import requests
 import cydifflib
 import re
-from dotenv import load_dotenv
 import os
 CLIENT_ID = os.getenv('CLIENT_ID')
 
@@ -62,7 +63,7 @@ def get_anime_id(anime):
         titles.append(node['title'])
         titles_ids.append((node['title'], node['id']))
     try:
-        closest_title = cydifflib.get_close_matches(anime, titles, n=1)[0]
+        closest_title = get_closest_match(anime, titles)
         idx = titles.index(closest_title)
         current_app.logger.debug(f"Data for anime entered {titles[idx]}")
         return titles_ids[idx][1]
@@ -70,3 +71,12 @@ def get_anime_id(anime):
         current_app.logger.error(f"Exception getting anime id for {anime}", e)
         return titles_ids[0][1] if len(titles_ids) > 0 else ""
 
+def get_closest_match(anime, titles):
+    raw_compare = cydifflib.get_close_matches(anime, titles, n=1)
+    translated_compare = process.extractOne(anime, titles)
+    if len(raw_compare) > 0:
+        return raw_compare[0] 
+    elif len(translated_compare) > 0:
+        return translated_compare[0]
+    else:
+        raise Exception("No match found")
