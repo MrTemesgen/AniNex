@@ -17,4 +17,4 @@ def getDiscussionPayload():
     return get_discussion(anime=anime, season=season, episode=episode)
 
 if __name__ == '__main__':
-    app.run(debug=False)
+    app.run(debug=True)
