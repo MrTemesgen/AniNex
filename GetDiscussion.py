@@ -8,45 +8,6 @@ import json
 CLIENT_ID = os.getenv('CLIENT_ID')
 OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
 
-def get_llm_suggestion(anime_title):
-    """
-    Gets an anime title suggestion from an LLM via OpenRouter as a fallback.
-    """
-    current_app.logger.info(f"Querying LLM for a better title for '{anime_title}'")
-    try:
-        response = requests.post(
-            url="https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json"
-            },
-            data=json.dumps({
-                "model": "openai/gpt-4o",
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": "You are an anime title expert. Given the user input, provide the most common or official English title for the anime that is most likely to be found on MyAnimeList.net. Return only the anime title itself and nothing else."
-                    },
-                    {
-                        "role": "user",
-                        "content": anime_title
-                    }
-                ]
-            })
-        )
-        response.raise_for_status()
-        data = response.json()
-        current_app.logger.info(f"LLM raw response: {data}") # Log the full response
-        suggestion = data['choices'][0]['message']['content'].strip()
-        current_app.logger.info(f"LLM suggested title: '{suggestion}'")
-        return suggestion
-    except requests.exceptions.RequestException as e:
-        current_app.logger.error(f"LLM API call failed: {e}")
-        return None
-
-def getDiscussionBaseUrl(discussion_id):
-    return f"https://api.myanimelist.net/v2/forum/topic/{discussion_id}?&limit=100"
-
 # Get the discussion for the episode or anime not found message
 def get_discussion(anime, season, episode):
     current_app.logger.info(f"GET Discussion for {anime}-{episode}")
@@ -57,7 +18,6 @@ def get_discussion(anime, season, episode):
     discussion = requests.get(getDiscussionBaseUrl(discussion_id), headers = {'X-MAL-CLIENT-ID': f'{CLIENT_ID}'}).json()
     data = discussion['data'] if 'data' in discussion else {}
     return jsonify(message = data)
-
 
 # Get the discussion link for the episode
 def get_discussion_link(anime, id, episode):
@@ -85,9 +45,13 @@ def get_discussion_link(anime, id, episode):
         current_app.logger.error(f"Exception getting Discussion link for {anime}-{episode}", e)
         None
 
+def getDiscussionBaseUrl(discussion_id):
+    return f"https://api.myanimelist.net/v2/forum/topic/{discussion_id}?&limit=100"
+
+
 def get_anime_id(anime, season):
     season = ' '+season if int(season) > 1 else ''
-    current_app.logger.info(f"GET Anime ID for {anime}")
+    current_app.logger.info(f"GET Anime ID for {anime} {CLIENT_ID}")
     BASE_URL = f'https://api.myanimelist.net/v2/anime?q={anime+season}&limit=100'
     data = requests.get(BASE_URL,  headers = {'X-MAL-CLIENT-ID': f'{CLIENT_ID}'}).json()
     print(data)
@@ -121,7 +85,7 @@ def get_closest_match(anime, season, titles):
 
     best_match = None
     best_score = 0
-
+    current_app.logger.info(f"Candidate names for '{anime}' from data.json: {candidate_names}")
     if candidate_names:
         current_app.logger.info(f"Found candidate names in data.json for {anime}")
         # For each candidate name, find the closest match in the titles list
@@ -150,3 +114,40 @@ def get_closest_match(anime, season, titles):
     # Final fallback: if LLM fails or no close match, return the first result from API
     current_app.logger.error(f"No close match found for '{anime}' using any method. Returning first available title.")
     return titles[0] if titles else ""
+
+
+def get_llm_suggestion(anime_title):
+    """
+    Gets an anime title suggestion from an LLM via OpenRouter as a fallback.
+    """
+    current_app.logger.info(f"Querying LLM for a better title for '{anime_title}'")
+    try:
+        response = requests.post(
+            url="https://openrouter.ai/api/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            data=json.dumps({
+                "model": "openrouter/free",
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You are an anime title expert. Given the user input, provide the most common or official English title for the anime that is most likely to be found on MyAnimeList.net. Return only the anime title itself and nothing else."
+                    },
+                    {
+                        "role": "user",
+                        "content": anime_title
+                    }
+                ]
+            })
+        )
+        response.raise_for_status()
+        data = response.json()
+        current_app.logger.info(f"LLM raw response: {data}") # Log the full response
+        suggestion = data['choices'][0]['message']['content'].strip()
+        current_app.logger.info(f"LLM suggested title: '{suggestion}'")
+        return suggestion
+    except requests.exceptions.RequestException as e:
+        current_app.logger.error(f"LLM API call failed: {e}")
+        return None
