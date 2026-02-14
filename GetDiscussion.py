@@ -129,7 +129,7 @@ def get_llm_suggestion(anime_title):
                 "Content-Type": "application/json"
             },
             data=json.dumps({
-                "model": "openrouter/free",
+                "model": "deepseek/deepseek-r1-0528:free",
                 "messages": [
                     {
                         "role": "system",
