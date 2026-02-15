@@ -49,54 +49,104 @@ def get_discussion_link(anime, id, episode):
 def getDiscussionBaseUrl(discussion_id):
     return f"https://api.myanimelist.net/v2/forum/topic/{discussion_id}?&limit=100"
 
-
 def get_anime_id(anime, season):
     season = ' ' + season if int(season) > 1 else ''
-    # Add fields=alternative_titles to get English + synonyms
-    BASE_URL = f'https://api.myanimelist.net/v2/anime?q={anime+season}&limit=100&fields=alternative_titles'
+    titles_ids = fetch_mal_titles(anime + season)
+    current_app.logger.info(f"Fetched {len(titles_ids)} titles from MAL for query '{anime + season}'")
+    if not titles_ids:
+        return ""
+
+    result = get_closest_match(anime, season, titles_ids)
+    if result:
+        return result
+
+    # LLM fallback — re-search MAL with the suggested title
+    current_app.logger.warning(f"No confident match for '{anime}', trying LLM fallback")
+    llm_title = get_llm_suggestion(anime)
+    if not llm_title:
+        return titles_ids[0][0] if titles_ids else ""
+
+    fallback_titles_ids = fetch_mal_titles(llm_title + season, limit=20)
+    if not fallback_titles_ids:
+        return titles_ids[0][0] if titles_ids else ""
+
+    result = get_closest_match(llm_title, season, fallback_titles_ids)
+    return result if result else fallback_titles_ids[0][0]
+
+
+def fetch_mal_titles(query, limit=100):
+    """Fetches and structures MAL search results into (id, variants) tuples."""
+    BASE_URL = f'https://api.myanimelist.net/v2/anime?q={query}&limit={limit}&fields=alternative_titles'
     data = requests.get(BASE_URL, headers={'X-MAL-CLIENT-ID': CLIENT_ID}).json()
 
     if 'data' not in data:
-        return ""
+        return []
 
     titles_ids = []
     for res in data['data']:
         node = res['node']
         alt = node.get('alternative_titles', {})
-        # Collect all title variants per anime
-        variants = {
-            'main': node['title'],          # romaji
-            'en': alt.get('en', ''),        # English
-            'synonyms': alt.get('synonyms', [])  # other names
-        }
-        titles_ids.append((node['id'], variants))
-
-    return score_and_pick(anime, titles_ids)
+        titles_ids.append((node['id'], {
+            'main': node['title'],
+            'en': alt.get('en', ''),
+            'synonyms': alt.get('synonyms', [])
+        }))
+    return titles_ids
 
 
-def score_and_pick(user_input, titles_ids):
-    """
-    titles_ids: list of (mal_id, {'main': str, 'en': str, 'synonyms': [str]})
-    """
-    normalized_input = user_input.lower().strip()
+def get_closest_match(anime, season, titles_ids):
+    with open('data.json', encoding='utf-8') as f:
+        all_title_groups = [entry['titles'] for entry in json.load(f)]
+
+    candidate_group = find_candidate_group(anime, all_title_groups)
+    candidate_names = [t + season for t in candidate_group] if candidate_group else [anime + season]
+    current_app.logger.info(f"Candidate names for matching: {candidate_names}")
+    best_id, best_score = score_and_pick(candidate_names, titles_ids)
+
+    current_app.logger.info(f"Best match score: {best_score:.2f}, id: {best_id}, for candidates: {candidate_names}")
+    return best_id if best_score > 0.6 else None
+
+def compute_score(candidate, variant):
+    candidate = candidate.lower().strip()
+    variant = variant.lower().strip()
+
+    base_score = SequenceMatcher(None, candidate, variant).ratio()
+
+    # Exact match
+    if candidate == variant:
+        return 1.0
+
+    # Candidate is a whole word found inside the variant
+    # e.g. "Onizuka" inside "Great Teacher Onizuka"
+    if re.search(rf'\b{re.escape(candidate)}\b', variant):
+        return max(base_score, 0.85)
+
+    # All tokens of the candidate appear in the variant
+    # e.g. "teacher onizuka" vs "great teacher onizuka"
+    candidate_tokens = set(candidate.split())
+    variant_tokens = set(variant.split())
+    if candidate_tokens.issubset(variant_tokens):
+        return max(base_score, 0.80)
+
+    return base_score
+
+def score_and_pick(candidates, titles_ids):
+    """Scores candidate names against all MAL title variants, returns (best_id, best_score)."""
     best_id = None
     best_score = 0
 
-    for mal_id, variants in titles_ids:
-        all_variants = [
-            variants['main'],
-            variants['en'],
-            *variants['synonyms']
-        ]
-        # Score against every variant, take the best
-        for variant in filter(None, all_variants):
-            score = SequenceMatcher(None, normalized_input, variant.lower()).ratio()
-            if score > best_score:
-                best_score = score
-                best_id = mal_id
+    for candidate in candidates:
+        normalized_candidate = candidate.lower().strip()
+        for mal_id, variants in titles_ids:
+            all_variants = [variants['main'], variants['en'], *variants['synonyms']]
+            for variant in filter(None, all_variants):
+                score = compute_score(normalized_candidate, variant)
+                if score > best_score:
+                    current_app.logger.debug(f"New best score {score:.2f} for candidate '{candidate}' vs variant '{variant}' (id: {mal_id})")
+                    best_score = score
+                    best_id = mal_id
 
-    current_app.logger.info(f"Best match score: {best_score}, id: {best_id}")
-    return best_id if best_score > 0.5 else ""
+    return best_id, best_score
 
 def find_candidate_group(anime_input, all_title_groups):
     normalized_input = anime_input.lower().strip()
