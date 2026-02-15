@@ -2,6 +2,7 @@ from flask import jsonify, current_app
 from bs4 import BeautifulSoup
 import requests
 import cydifflib
+from difflib import SequenceMatcher
 import re
 import os
 import json
@@ -48,73 +49,125 @@ def get_discussion_link(anime, id, episode):
 def getDiscussionBaseUrl(discussion_id):
     return f"https://api.myanimelist.net/v2/forum/topic/{discussion_id}?&limit=100"
 
-
 def get_anime_id(anime, season):
-    season = ' '+season if int(season) > 1 else ''
-    current_app.logger.info(f"GET Anime ID for {anime} {CLIENT_ID}")
-    BASE_URL = f'https://api.myanimelist.net/v2/anime?q={anime+season}&limit=100'
-    data = requests.get(BASE_URL,  headers = {'X-MAL-CLIENT-ID': f'{CLIENT_ID}'}).json()
-    print(data)
-    if 'data' not in data:
+    season = ' ' + season if int(season) > 1 else ''
+    titles_ids = fetch_mal_titles(anime + season)
+    current_app.logger.info(f"Fetched {len(titles_ids)} titles from MAL for query '{anime + season}'")
+    if not titles_ids:
         return ""
-    data = data['data']
-    titles_ids = []
-    titles = []
-    for res in data:
-        node = res['node']
-        titles.append(node['title'])
-        titles_ids.append((node['title'], node['id']))
-    try:
-        closest_title = get_closest_match(anime, season, titles)
-        idx = titles.index(closest_title)
-        current_app.logger.debug(f"Closest title found: {closest_title} {titles_ids[idx][1]}")
-        current_app.logger.debug(f"Data for anime entered {titles[idx]}")
-        return titles_ids[idx][1]
-    except Exception as e:
-        current_app.logger.error(f"Exception getting anime id for {anime}", e)
-        return titles_ids[0][1] if len(titles_ids) > 0 else ""
 
-def get_closest_match(anime, season, titles):
-    # Load data.json and collect all names for the searched anime
-    with open('data.json', encoding='utf-8') as f:
-        anime_data = json.load(f)
-    all_title_groups = [anime_entry['titles'] for anime_entry in anime_data]
-    matching_title_group = [title_group for title_group in all_title_groups if any(anime.lower() == title.lower() for title in title_group)]
-    # Find all names that closely match the searched anime
-    candidate_names = [title for group in matching_title_group for title in group]
+    result = get_closest_match(anime, season, titles_ids)
+    if result:
+        return result
 
-    best_match = None
-    best_score = 0
-    current_app.logger.info(f"Candidate names for '{anime}' from data.json: {candidate_names}")
-    if candidate_names:
-        current_app.logger.info(f"Found candidate names in data.json for {anime}")
-        # For each candidate name, find the closest match in the titles list
-        for candidate in candidate_names:
-            candidate = candidate+season
-            matches = cydifflib.get_close_matches(candidate, titles, n=1, cutoff=0.0)
-            if matches:
-                # Use SequenceMatcher to get a similarity ratio
-                score = cydifflib.SequenceMatcher(None, candidate, matches[0]).ratio()
-                if score > best_score:
-                    best_score = score
-                    best_match = matches[0]
-        if best_match:
-            return best_match
-
-    # Fallback: If no match found in local data, try LLM suggestion
-    current_app.logger.warning(f"No definitive match found for '{anime}' in local data. Trying LLM fallback.")
+    # LLM fallback — re-search MAL with the suggested title
+    current_app.logger.warning(f"No confident match for '{anime}', trying LLM fallback")
     llm_title = get_llm_suggestion(anime)
-    if llm_title:
-        llm_title_with_season = llm_title + season
-        matches = cydifflib.get_close_matches(llm_title_with_season, titles, n=1, cutoff=0.6)
-        if matches:
-            current_app.logger.info(f"Found close match for LLM suggestion: '{matches[0]}'")
-            return matches[0]
+    if not llm_title:
+        return titles_ids[0][0] if titles_ids else ""
 
-    # Final fallback: if LLM fails or no close match, return the first result from API
-    current_app.logger.error(f"No close match found for '{anime}' using any method. Returning first available title.")
-    return titles[0] if titles else ""
+    fallback_titles_ids = fetch_mal_titles(llm_title + season, limit=20)
+    if not fallback_titles_ids:
+        return titles_ids[0][0] if titles_ids else ""
 
+    result = get_closest_match(llm_title, season, fallback_titles_ids)
+    return result if result else fallback_titles_ids[0][0]
+
+
+def fetch_mal_titles(query, limit=100):
+    """Fetches and structures MAL search results into (id, variants) tuples."""
+    BASE_URL = f'https://api.myanimelist.net/v2/anime?q={query}&limit={limit}&fields=alternative_titles'
+    data = requests.get(BASE_URL, headers={'X-MAL-CLIENT-ID': CLIENT_ID}).json()
+
+    if 'data' not in data:
+        return []
+
+    titles_ids = []
+    for res in data['data']:
+        node = res['node']
+        alt = node.get('alternative_titles', {})
+        titles_ids.append((node['id'], {
+            'main': node['title'],
+            'en': alt.get('en', ''),
+            'synonyms': alt.get('synonyms', [])
+        }))
+    return titles_ids
+
+
+def get_closest_match(anime, season, titles_ids):
+    with open('data.json', encoding='utf-8') as f:
+        all_title_groups = [entry['titles'] for entry in json.load(f)]
+
+    candidate_group = find_candidate_group(anime, all_title_groups)
+    candidate_names = [t + season for t in candidate_group] if candidate_group else [anime + season]
+    current_app.logger.info(f"Candidate names for matching: {candidate_names}")
+    best_id, best_score = score_and_pick(candidate_names, titles_ids)
+
+    current_app.logger.info(f"Best match score: {best_score:.2f}, id: {best_id}, for candidates: {candidate_names}")
+    return best_id if best_score > 0.6 else None
+
+def compute_score(candidate, variant):
+    candidate = candidate.lower().strip()
+    variant = variant.lower().strip()
+
+    base_score = SequenceMatcher(None, candidate, variant).ratio()
+
+    # Exact match
+    if candidate == variant:
+        return 1.0
+
+    # Candidate is a whole word found inside the variant
+    # e.g. "Onizuka" inside "Great Teacher Onizuka"
+    if re.search(rf'\b{re.escape(candidate)}\b', variant):
+        return max(base_score, 0.85)
+
+    # All tokens of the candidate appear in the variant
+    # e.g. "teacher onizuka" vs "great teacher onizuka"
+    candidate_tokens = set(candidate.split())
+    variant_tokens = set(variant.split())
+    if candidate_tokens.issubset(variant_tokens):
+        return max(base_score, 0.80)
+
+    return base_score
+
+def score_and_pick(candidates, titles_ids):
+    """Scores candidate names against all MAL title variants, returns (best_id, best_score)."""
+    best_id = None
+    best_score = 0
+
+    for candidate in candidates:
+        normalized_candidate = candidate.lower().strip()
+        for mal_id, variants in titles_ids:
+            all_variants = [variants['main'], variants['en'], *variants['synonyms']]
+            for variant in filter(None, all_variants):
+                score = compute_score(normalized_candidate, variant)
+                if score > best_score:
+                    current_app.logger.debug(f"New best score {score:.2f} for candidate '{candidate}' vs variant '{variant}' (id: {mal_id})")
+                    best_score = score
+                    best_id = mal_id
+
+    return best_id, best_score
+
+def find_candidate_group(anime_input, all_title_groups):
+    normalized_input = anime_input.lower().strip()
+    
+    # First try exact match (fast)
+    for group in all_title_groups:
+        if any(normalized_input == t.lower() for t in group):
+            return group
+    
+    # Then try fuzzy match across all titles in all groups
+    all_titles_flat = [(t, group) for group in all_title_groups for t in group]
+    best_score = 0
+    best_group = None
+    
+    for title, group in all_titles_flat:
+        score = SequenceMatcher(None, normalized_input, title.lower()).ratio()
+        if score > best_score and score > 0.75:  # threshold
+            best_score = score
+            best_group = group
+    
+    return best_group  # None if nothing good found
 
 def get_llm_suggestion(anime_title):
     """
@@ -129,11 +182,14 @@ def get_llm_suggestion(anime_title):
                 "Content-Type": "application/json"
             },
             data=json.dumps({
-                "model": "deepseek/deepseek-r1-0528:free",
+                "model": "google/gemma-3-4b-it:free",
                 "messages": [
                     {
                         "role": "system",
-                        "content": "You are an anime title expert. Given the user input, provide the most common or official English title for the anime that is most likely to be found on MyAnimeList.net. Return only the anime title itself and nothing else."
+                        "content": "You are an anime database assistant. "
+        "When given an anime title in any language or format, respond with ONLY "
+        "the most common romanized or English title as it appears on MyAnimeList. "
+        "No punctuation, no explanation, just the title."
                     },
                     {
                         "role": "user",
