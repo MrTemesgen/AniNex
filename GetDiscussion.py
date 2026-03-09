@@ -13,9 +13,11 @@ OPENROUTER_API_KEY = os.getenv('OPENROUTER_API_KEY')
 def get_discussion(anime, season, episode):
     current_app.logger.info(f"GET Discussion for {anime}-{episode}")
     anime_id = get_anime_id(anime, season)
+    current_app.logger.info(f"Found anime_id: {anime_id}")
     if anime_id == "": return jsonify(message = "Anime not found")
 
-    discussion_id = get_discussion_link(anime, anime_id, episode) 
+    discussion_id = get_discussion_link(anime, anime_id, episode)
+    current_app.logger.info(f"Found discussion_id: {discussion_id}")
     discussion = requests.get(getDiscussionBaseUrl(discussion_id), headers = {'X-MAL-CLIENT-ID': f'{CLIENT_ID}'}).json()
     data = discussion['data'] if 'data' in discussion else {}
     return jsonify(message = data)
@@ -28,7 +30,9 @@ def get_discussion_link(anime, id, episode):
         # Each page has 100 episodes, so we need to offset the page by
         # the greatest multiple of 100 less than the episode number
         offset = ((episode-1)//100)*100 if episode > 100 else 0
+        current_app.logger.info(f"Offset is {offset}")
         BASE_URL = f'https://myanimelist.net/anime/{id}/{anime}/episode?offset={offset}'
+        current_app.logger.info(f"BASE_URL is {BASE_URL}")
         
         response = requests.get(BASE_URL)
         soup = BeautifulSoup(response.content, 'html.parser')
@@ -41,6 +45,7 @@ def get_discussion_link(anime, id, episode):
         idx = 100 if remainder == 0 else remainder 
         row = table.find_all('tr')[idx]
         link = row.find_all(['td', 'th'])[-1].find('a')['href']
+        current_app.logger.info(f"Found link: {link}")
         return re.findall('=(.*)', link)[0]
     except Exception as e:
         current_app.logger.error(f"Exception getting Discussion link for {anime}-{episode}", e)
@@ -57,6 +62,7 @@ def get_anime_id(anime, season):
         return ""
 
     result = get_closest_match(anime, season, titles_ids)
+    current_app.logger.info(f"Closest match result: {result}")
     if result:
         return result
 
@@ -77,6 +83,7 @@ def get_anime_id(anime, season):
 def fetch_mal_titles(query, limit=100):
     """Fetches and structures MAL search results into (id, variants) tuples."""
     BASE_URL = f'https://api.myanimelist.net/v2/anime?q={query}&limit={limit}&fields=alternative_titles'
+    current_app.logger.info(f"Fetching MAL titles from {BASE_URL}")
     data = requests.get(BASE_URL, headers={'X-MAL-CLIENT-ID': CLIENT_ID}).json()
 
     if 'data' not in data:
@@ -99,6 +106,7 @@ def get_closest_match(anime, season, titles_ids):
         all_title_groups = [entry['titles'] for entry in json.load(f)]
 
     candidate_group = find_candidate_group(anime, all_title_groups)
+    current_app.logger.info(f"Found candidate group: {candidate_group}")
     candidate_names = [t + season for t in candidate_group] if candidate_group else [anime + season]
     current_app.logger.info(f"Candidate names for matching: {candidate_names}")
     best_id, best_score = score_and_pick(candidate_names, titles_ids)
@@ -142,7 +150,7 @@ def score_and_pick(candidates, titles_ids):
             for variant in filter(None, all_variants):
                 score = compute_score(normalized_candidate, variant)
                 if score > best_score:
-                    current_app.logger.debug(f"New best score {score:.2f} for candidate '{candidate}' vs variant '{variant}' (id: {mal_id})")
+                    current_app.logger.info(f"New best score {score:.2f} for candidate '{candidate}' vs variant '{variant}' (id: {mal_id})")
                     best_score = score
                     best_id = mal_id
 
@@ -154,6 +162,7 @@ def find_candidate_group(anime_input, all_title_groups):
     # First try exact match (fast)
     for group in all_title_groups:
         if any(normalized_input == t.lower() for t in group):
+            current_app.logger.info(f"Found exact match for '{anime_input}' in group: {group}")
             return group
     
     # Then try fuzzy match across all titles in all groups
@@ -166,6 +175,8 @@ def find_candidate_group(anime_input, all_title_groups):
         if score > best_score and score > 0.75:  # threshold
             best_score = score
             best_group = group
+            current_app.logger.info(f"Found new best fuzzy match with score {best_score:.2f} for '{anime_input}' in group: {group}")
+
     
     return best_group  # None if nothing good found
 
