@@ -1,5 +1,5 @@
 from flask import Flask, jsonify, current_app
-from GetDiscussion import get_discussion
+from GetDiscussionV2 import get_discussion
 from flask_cors import CORS
 from flask import request
 app = Flask(__name__)
@@ -14,7 +14,7 @@ def getDiscussionPayload():
     anime = data.get('anime')
     season = data.get('season')
     episode = data.get('episode')
-    return get_discussion(anime=anime, season=season, episode=episode)
+    return get_discussion(anime_query=anime, season=season, episode=episode)
 
 if __name__ == '__main__':
     app.run(debug=True)
