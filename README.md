@@ -1,7 +1,7 @@
 # AniNex
 API for getting anime episode comments from MAL
  
-POST url: [https://aninex.onrender.com/discussion](https://aninex-60a22ea8db43.herokuapp.com/)
+POST url: [https://aninex-60a22ea8db43.herokuapp.com/](https://aninex-60a22ea8db43.herokuapp.com/)
 ### Request Body
 
 Send a JSON payload with the following fields:
