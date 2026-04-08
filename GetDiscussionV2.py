@@ -3,8 +3,9 @@ from flask import jsonify, current_app
 from bs4 import BeautifulSoup
 import re
 import os
+import constants
+from urllib.parse import urljoin
 
-ANILIST_API_URL = 'https://graphql.anilist.co'
 CLIENT_ID = os.getenv('CLIENT_ID')
 
 # ---------------------------------------------------------
@@ -12,40 +13,40 @@ CLIENT_ID = os.getenv('CLIENT_ID')
 # ---------------------------------------------------------
 
 def fetch_season_tree(search_term):
-    # Grabs the exact season searched, plus a few levels of sequels for split-cours
-    graphql_query = """
-    fragment animeFields on Media {
-      idMal
-      episodes
-      format
-      title { romaji english }
-      nextAiringEpisode { episode }
-    }
-
-    query ($search: String) {
-      Media (search: $search, type: ANIME, sort: [SEARCH_MATCH, START_DATE]) {
-        ...animeFields
-        relations {
-          edges {
-            relationType
-            node {
-              ...animeFields
-              relations {
-                edges {
-                  relationType
-                  node {
-                    ...animeFields
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-    """
-    res = requests.post(ANILIST_API_URL, json={'query': graphql_query, 'variables': {'search': search_term}})
+    res = requests.post(constants.ANILIST_API_URL, json={'query': constants.GRAPHQL_QUERY, 'variables': {'search': search_term}})
     return res.json().get('data', {}).get('Media')
+
+def calculate_global_offset(start_node):
+    offset = 0
+    current = start_node
+    visited = set() # Safety against infinite loops
+
+    while current:
+        current_id = current.get('idMal') or current.get('title', {}).get('romaji')
+        if current_id in visited:
+            break
+        visited.add(current_id)
+
+        prev_node = None
+        if current.get('relations') and current.get('relations').get('edges'):
+            for edge in current.get('relations').get('edges'):
+                if edge['relationType'] == constants.RELATION_TYPE_PREQUEL:
+                    prev_node = edge['node']
+                    break
+
+        if prev_node:
+            fmt = prev_node.get('format')
+            # Only count canonical TV episodes towards the global offset
+            if fmt not in [constants.FORMAT_MOVIE, constants.FORMAT_OVA, constants.FORMAT_SPECIAL]:
+                ep_count = prev_node.get('episodes')
+                if not ep_count:
+                    next_airing = prev_node.get('nextAiringEpisode')
+                    ep_count = (next_airing.get('episode', 2) - 1) if next_airing else 0
+                offset += ep_count
+                
+        current = prev_node
+
+    return offset
 
 # ---------------------------------------------------------
 # 2. RESOLVERS & FALLBACKS
@@ -62,7 +63,7 @@ def fallback_mal_search(anime_query, season):
         search_term = f"{anime_query} Season {season}"
         
     try:
-        url = f"https://api.myanimelist.net/v2/anime"
+        url = constants.MAL_ANIME_URL
         params = {'q': search_term, 'limit': 1}
         response = requests.get(url, params=params, headers={'X-MAL-CLIENT-ID': CLIENT_ID})
         
@@ -91,12 +92,26 @@ def resolve_mal_id_with_split_cour(anime_query, season, episode):
     current_node = fetch_season_tree(search_term)
     
     if not current_node:
-        # Absolute fallback if AniList returns nothing
         return fallback_mal_search(anime_query, season), target_ep, search_term.replace(' ', '_')
+
+    # --- NEW: DETECT LOCAL VS GLOBAL EPISODES ---
+    if season_str not in ['0', 'movie', 'ova', 'special']:
+        global_offset = calculate_global_offset(current_node)
+        current_app.logger.info(f"Calculated global offset for S{season}: {global_offset} episodes.")
+
+        ep_count = current_node.get('episodes') or 24
+        
+        # If target episode is larger than this season's first cour AND larger than the offset,
+        # it is highly probable they sent an absolute/global episode count.
+        if target_ep > global_offset and target_ep > ep_count:
+            current_app.logger.info(f"Target ep {target_ep} is > offset ({global_offset}). Treating as GLOBAL.")
+            target_ep = target_ep - global_offset
+        else:
+            current_app.logger.info(f"Treating target episode {target_ep} as LOCAL.")
 
     accumulated_eps = 0
     
-    # 3. Walk forward ONLY from the start of the requested season
+    # 3. Walk forward ONLY from the start of the requested season (handling split cours)
     while current_node:
         mal_id = current_node.get('idMal')
         fmt = current_node.get('format')
@@ -111,7 +126,7 @@ def resolve_mal_id_with_split_cour(anime_query, season, episode):
         slug = title.replace(' ', '_')
         
         # Skip non-TV formats UNLESS the user explicitly asked for Season 0/Movie
-        if fmt in ['MOVIE', 'OVA', 'SPECIAL'] and season_str not in ['0', 'movie', 'ova', 'special']:
+        if fmt in [constants.FORMAT_MOVIE, constants.FORMAT_OVA, constants.FORMAT_SPECIAL] and season_str not in ['0', 'movie', 'ova', 'special']:
             pass 
         else:
             # Check if the requested episode falls in this part of the split-cour
@@ -123,14 +138,13 @@ def resolve_mal_id_with_split_cour(anime_query, season, episode):
                     
                 return mal_id, local_ep, slug
             
-            # If the episode is larger than this part, add to the pile and check the sequel
             accumulated_eps += ep_count
             
         # Move to the sequel
         next_node = None
         if current_node.get('relations') and current_node['relations'].get('edges'):
             for edge in current_node['relations']['edges']:
-                if edge['relationType'] == 'SEQUEL':
+                if edge['relationType'] == constants.RELATION_TYPE_SEQUEL:
                     next_node = edge['node']
                     break
                     
@@ -159,7 +173,11 @@ def get_discussion_link(anime, id, episode):
         idx = 100 if remainder == 0 else remainder 
         row = table.find_all('tr')[idx]
         link = row.find_all(['td', 'th'])[-1].find('a')['href']
-        return re.findall('=(.*)', link)[0]
+        
+        # --- NEW: Strict Regex Extraction ---
+        match = re.search(r'topicid=(\d+)', link)
+        return match.group(1) if match else None
+        
     except Exception as e:
         current_app.logger.error(f"Scraper failed for {anime}-{episode}: {e}")
         return None
@@ -168,7 +186,7 @@ def fallback_forum_search(clean_title, local_ep):
     # If the episode just aired and the HTML table isn't updated, search the forum directly
     query = f"{clean_title} Episode {local_ep} Discussion"
     try:
-        url = "https://api.myanimelist.net/v2/forum/topics"
+        url = constants.MAL_FORUM_URL
         params = {'q': query, 'limit': 5}
         response = requests.get(url, params=params, headers={'X-MAL-CLIENT-ID': CLIENT_ID})
         
@@ -182,6 +200,97 @@ def fallback_forum_search(clean_title, local_ep):
         current_app.logger.error(f"Fallback forum search failed: {e}")
     return None
 
+def normalize_text(value):
+    if not value:
+        return ""
+    return re.sub(r'\s+', ' ', value).strip()
+
+def scrape_forum_topic_html(discussion_id):
+    try:
+        topic_url = f"https://myanimelist.net/forum/?topicid={discussion_id}"
+        response = requests.get(topic_url)
+        response.raise_for_status()
+
+        soup = BeautifulSoup(response.content, 'html.parser')
+        title = normalize_text(soup.title.get_text()) if soup.title else f"MAL Topic {discussion_id}"
+
+        post_selectors = [
+            'div.message-wrapper',
+            'table.body[id^="message"]',
+            'div.forum-topic-message.message',
+            'div.forum-post',
+            'div.js-forum-topic-post',
+            'tr[id^="topicRow"]',
+            'div[id^="message"]',
+            'table.forum_board_view tr',
+        ]
+
+        containers = []
+        for selector in post_selectors:
+            containers = soup.select(selector)
+            if containers:
+                break
+
+        posts = []
+        seen_keys = set()
+
+        for index, container in enumerate(containers, start=1):
+            profile_link = container.select_one('a[href*="/profile/"], a[href*="profile.php"]')
+            body_node = container.select_one(
+                '.forum-topic-message.message, table.body td, table.body, .message, .content, .forum-post-message, .js-forum-post-body, [id^="postMessage"]'
+            )
+
+            body_text = normalize_text(body_node.get_text(" ", strip=True) if body_node else container.get_text(" ", strip=True))
+            if not body_text:
+                continue
+
+            username = normalize_text(profile_link.get_text(" ", strip=True) if profile_link else "")
+            author_href = profile_link.get('href') if profile_link else None
+
+            time_node = container.select_one('time, .date, .forum-post-date, .message-header .date, small')
+            created_at = normalize_text(
+                (time_node.get('datetime') if time_node and time_node.has_attr('datetime') else time_node.get_text(" ", strip=True))
+                if time_node else ""
+            )
+
+            post_anchor = (
+                container.get('id')
+                or (body_node.get('id') if body_node else None)
+                or (container.select_one('table.body[id]')['id'] if container.select_one('table.body[id]') else None)
+                or f"post-{index}"
+            )
+            dedupe_key = (username, body_text[:120])
+            if dedupe_key in seen_keys:
+                continue
+            seen_keys.add(dedupe_key)
+
+            posts.append({
+                'id': post_anchor,
+                'number': len(posts) + 1,
+                'created_at': created_at,
+                'created_by': {
+                    'name': username,
+                    'forum_avator': '',
+                    'href': urljoin(topic_url, author_href) if author_href else ''
+                },
+                'body': body_text,
+            })
+
+        if not posts:
+            return None
+
+        return {
+            'id': int(discussion_id),
+            'title': title,
+            'num_of_posts': len(posts),
+            'posts': posts,
+            'source': 'html_scrape',
+            'url': topic_url,
+        }
+    except Exception as e:
+        current_app.logger.error(f"Forum HTML scrape failed for topic {discussion_id}: {e}")
+        return None
+
 # ---------------------------------------------------------
 # 4. MAIN ENDPOINT
 # ---------------------------------------------------------
@@ -191,7 +300,7 @@ def get_discussion(anime_query, season, episode):
     mal_id, local_ep, anime_slug = resolve_mal_id_with_split_cour(anime_query, season, episode)
 
     if not mal_id:
-        return jsonify(message="Could not find a matching MAL ID for this season.")
+        return jsonify(message=constants.MESSAGE_MAL_ID_NOT_FOUND)
 
     # 1. Scrape the discussion ID
     discussion_id = get_discussion_link(anime_slug, mal_id, local_ep)
@@ -203,10 +312,23 @@ def get_discussion(anime_query, season, episode):
         discussion_id = fallback_forum_search(clean_title, local_ep)
 
     if not discussion_id:
-        return jsonify(message="Discussion thread not found on MAL. The episode may not have aired yet.")
+        return jsonify(message=constants.MESSAGE_DISCUSSION_NOT_FOUND)
 
     # Fetch the forum posts
     mal_forum_url = f"https://api.myanimelist.net/v2/forum/topic/{discussion_id}?limit=100"
     response = requests.get(mal_forum_url, headers={'X-MAL-CLIENT-ID': CLIENT_ID})
     
-    return jsonify(message=response.json().get('data', {}))
+    # Prefer the structured API response when MAL allows it.
+    mal_data = response.json()
+    if 'error' in mal_data:
+        current_app.logger.error(f"MAL API Error: {mal_data}")
+        error_payload = mal_data.get('error', {})
+        error_code = error_payload.get('error') if isinstance(error_payload, dict) else error_payload
+        if error_code == 'forbidden':
+            current_app.logger.info(f"Falling back to HTML forum scrape for topic {discussion_id}")
+            scraped_topic = scrape_forum_topic_html(discussion_id)
+            if scraped_topic:
+                return jsonify(message=scraped_topic)
+        return jsonify(error=mal_data, message="MAL API rejected the discussion ID.")
+        
+    return jsonify(message=mal_data.get('data', {}))
