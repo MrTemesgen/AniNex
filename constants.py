@@ -4,6 +4,7 @@ ANILIST_API_URL = 'https://graphql.anilist.co'
 
 GRAPHQL_QUERY = """
     fragment animeFields on Media {
+      id
       idMal
       episodes
       format
@@ -43,6 +44,34 @@ GRAPHQL_QUERY = """
                   }
                 }
               }
+            }
+          }
+        }
+      }
+    }
+"""
+
+# Fetches a single Media's immediate relations by AniList id. Used to walk a franchise's
+# prequel/sequel chain one hop at a time when the nested GRAPHQL_QUERY runs out of depth.
+GRAPHQL_NODE_QUERY = """
+    query ($id: Int) {
+      Media (id: $id, type: ANIME) {
+        id
+        idMal
+        episodes
+        format
+        title { romaji english }
+        nextAiringEpisode { episode }
+        relations {
+          edges {
+            relationType
+            node {
+              id
+              idMal
+              episodes
+              format
+              title { romaji english }
+              nextAiringEpisode { episode }
             }
           }
         }

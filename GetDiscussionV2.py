@@ -17,6 +17,109 @@ def fetch_season_tree(search_term):
     # AniList returns {"data": null, "errors": [...]} on error, so guard against None.
     return (res.json().get('data') or {}).get('Media')
 
+# Small in-process cache so repeated chain walks (and repeat requests for popular shows)
+# don't re-hit AniList for the same node. Bounded to avoid unbounded growth on a long-lived dyno.
+_NODE_CACHE = {}
+_NODE_CACHE_MAX = 512
+
+def fetch_node_relations(anilist_id):
+    """Fetch a single Media's immediate relations by AniList id, for stepping along a
+    franchise chain when the nested season tree runs out of depth. Returns None on failure."""
+    if not anilist_id:
+        return None
+    if anilist_id in _NODE_CACHE:
+        return _NODE_CACHE[anilist_id]
+    try:
+        res = requests.post(constants.ANILIST_API_URL, json={'query': constants.GRAPHQL_NODE_QUERY, 'variables': {'id': anilist_id}}, timeout=10)
+        node = (res.json().get('data') or {}).get('Media')
+    except Exception as e:
+        current_app.logger.error(f"AniList node fetch failed for id {anilist_id}: {e}")
+        return None
+    if node:
+        if len(_NODE_CACHE) >= _NODE_CACHE_MAX:
+            _NODE_CACHE.clear()
+        _NODE_CACHE[anilist_id] = node
+    return node
+
+def _normalize_title(title):
+    return re.sub(r'\s+', ' ', (title or '')).strip().lower()
+
+def _tv_episode_count(node):
+    """Episode count for a node, falling back to nextAiringEpisode for currently-airing
+    entries. Returns 0 when unknown so it doesn't distort sums."""
+    count = node.get('episodes')
+    if not count:
+        next_airing = node.get('nextAiringEpisode')
+        count = (next_airing.get('episode', 1) - 1) if next_airing else 0
+    return count or 0
+
+def _is_non_tv(node):
+    return node.get('format') in [constants.FORMAT_MOVIE, constants.FORMAT_OVA, constants.FORMAT_SPECIAL]
+
+def _related_node(node, relation_type):
+    for edge in (node.get('relations') or {}).get('edges', []):
+        if edge['relationType'] == relation_type:
+            return edge['node']
+    return None
+
+def _step(node, relation_type):
+    """Follow one prequel/sequel hop, re-querying AniList if the in-tree node lacks relations."""
+    nxt = _related_node(node, relation_type)
+    if nxt is None and node.get('id'):
+        refetched = fetch_node_relations(node['id'])
+        if refetched:
+            nxt = _related_node(refetched, relation_type)
+    return nxt
+
+def calculate_season_span(season_node):
+    """Total canonical-TV episodes for this season across its cours (e.g. '... Part 2'),
+    following SEQUEL links while the title stays a continuation of this season. Used to
+    decide whether an episode number is too large to be local to this season."""
+    base = _normalize_title(season_node.get('title', {}).get('romaji'))
+    total = _tv_episode_count(season_node)
+    visited = {season_node.get('id') or season_node.get('idMal')}
+    current = season_node
+
+    for _ in range(20):  # bound against cycles / runaway chains
+        nxt = _step(current, constants.RELATION_TYPE_SEQUEL)
+        if not nxt:
+            break
+        # A cour continuation's title is this season's title plus a suffix (Part 2, etc.).
+        # A different base title marks the start of the next season, so stop there.
+        if not _normalize_title(nxt.get('title', {}).get('romaji')).startswith(base):
+            break
+        key = nxt.get('id') or nxt.get('idMal')
+        if key in visited:
+            break
+        visited.add(key)
+        if not _is_non_tv(nxt):
+            total += _tv_episode_count(nxt)
+        current = nxt
+
+    return total
+
+def calculate_global_offset(season_node):
+    """Total canonical-TV episodes that aired BEFORE this season — the sum of its prequel
+    chain back to the franchise root. Steps hop-by-hop, re-querying AniList as needed so
+    long franchises are fully traversed (a single nested query can't reach the root)."""
+    offset = 0
+    visited = {season_node.get('id') or season_node.get('idMal')}
+    current = season_node
+
+    for _ in range(20):  # bound against cycles / runaway chains
+        prev = _step(current, constants.RELATION_TYPE_PREQUEL)
+        if not prev:
+            break
+        key = prev.get('id') or prev.get('idMal')
+        if key in visited:
+            break
+        visited.add(key)
+        if not _is_non_tv(prev):
+            offset += _tv_episode_count(prev)
+        current = prev
+
+    return offset
+
 # ---------------------------------------------------------
 # 2. RESOLVERS & FALLBACKS
 # ---------------------------------------------------------
@@ -63,10 +166,21 @@ def resolve_mal_id_with_split_cour(anime_query, season, episode):
     if not current_node:
         return fallback_mal_search(anime_query, season), target_ep, search_term.replace(' ', '_')
 
-    # The episode number arrives local to the title the user is watching (e.g. Crunchyroll
-    # numbers each season continuously across its cours). The split-cour walk-forward below
-    # maps that number onto the correct AniList/MAL entry, so no global-offset adjustment is
-    # needed — attempting one mis-resolved split-cour shows onto early episodes.
+    # Crunchyroll usually numbers an episode locally to the season being watched (continuous
+    # across that season's cours), but sometimes sends the franchise-wide (global) number with
+    # a correct season. Only reinterpret as global when BOTH hold: a real season > 1 was given
+    # AND the episode exceeds this season's full length. When the season is unknown/1 we stay
+    # local, so split-cour locals (e.g. Dr. Stone) are never mis-mapped onto early episodes.
+    if season_str.isdigit() and int(season_str) > 1:
+        season_span = calculate_season_span(current_node)
+        if target_ep > season_span:
+            offset = calculate_global_offset(current_node)
+            current_app.logger.info(f"Episode {target_ep} exceeds season span {season_span}; treating as GLOBAL (prequel offset {offset}).")
+            # Only subtract a sane offset; otherwise leave the number untouched and treat as local.
+            if 0 < offset < target_ep:
+                target_ep -= offset
+        else:
+            current_app.logger.info(f"Episode {target_ep} within season span {season_span}; treating as LOCAL.")
 
     accumulated_eps = 0
     
