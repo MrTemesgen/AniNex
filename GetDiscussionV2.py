@@ -13,40 +13,9 @@ CLIENT_ID = os.getenv('CLIENT_ID')
 # ---------------------------------------------------------
 
 def fetch_season_tree(search_term):
-    res = requests.post(constants.ANILIST_API_URL, json={'query': constants.GRAPHQL_QUERY, 'variables': {'search': search_term}})
-    return res.json().get('data', {}).get('Media')
-
-def calculate_global_offset(start_node):
-    offset = 0
-    current = start_node
-    visited = set() # Safety against infinite loops
-
-    while current:
-        current_id = current.get('idMal') or current.get('title', {}).get('romaji')
-        if current_id in visited:
-            break
-        visited.add(current_id)
-
-        prev_node = None
-        if current.get('relations') and current.get('relations').get('edges'):
-            for edge in current.get('relations').get('edges'):
-                if edge['relationType'] == constants.RELATION_TYPE_PREQUEL:
-                    prev_node = edge['node']
-                    break
-
-        if prev_node:
-            fmt = prev_node.get('format')
-            # Only count canonical TV episodes towards the global offset
-            if fmt not in [constants.FORMAT_MOVIE, constants.FORMAT_OVA, constants.FORMAT_SPECIAL]:
-                ep_count = prev_node.get('episodes')
-                if not ep_count:
-                    next_airing = prev_node.get('nextAiringEpisode')
-                    ep_count = (next_airing.get('episode', 2) - 1) if next_airing else 0
-                offset += ep_count
-                
-        current = prev_node
-
-    return offset
+    res = requests.post(constants.ANILIST_API_URL, json={'query': constants.GRAPHQL_QUERY, 'variables': {'search': search_term}}, timeout=10)
+    # AniList returns {"data": null, "errors": [...]} on error, so guard against None.
+    return (res.json().get('data') or {}).get('Media')
 
 # ---------------------------------------------------------
 # 2. RESOLVERS & FALLBACKS
@@ -65,7 +34,7 @@ def fallback_mal_search(anime_query, season):
     try:
         url = constants.MAL_ANIME_URL
         params = {'q': search_term, 'limit': 1}
-        response = requests.get(url, params=params, headers={'X-MAL-CLIENT-ID': CLIENT_ID})
+        response = requests.get(url, params=params, headers={'X-MAL-CLIENT-ID': CLIENT_ID}, timeout=10)
         
         if response.status_code == 200:
             data = response.json().get('data', [])
@@ -94,20 +63,10 @@ def resolve_mal_id_with_split_cour(anime_query, season, episode):
     if not current_node:
         return fallback_mal_search(anime_query, season), target_ep, search_term.replace(' ', '_')
 
-    # --- NEW: DETECT LOCAL VS GLOBAL EPISODES ---
-    if season_str not in ['0', 'movie', 'ova', 'special']:
-        global_offset = calculate_global_offset(current_node)
-        current_app.logger.info(f"Calculated global offset for S{season}: {global_offset} episodes.")
-
-        ep_count = current_node.get('episodes') or 24
-        
-        # If target episode is larger than this season's first cour AND larger than the offset,
-        # it is highly probable they sent an absolute/global episode count.
-        if target_ep > global_offset and target_ep > ep_count:
-            current_app.logger.info(f"Target ep {target_ep} is > offset ({global_offset}). Treating as GLOBAL.")
-            target_ep = target_ep - global_offset
-        else:
-            current_app.logger.info(f"Treating target episode {target_ep} as LOCAL.")
+    # The episode number arrives local to the title the user is watching (e.g. Crunchyroll
+    # numbers each season continuously across its cours). The split-cour walk-forward below
+    # maps that number onto the correct AniList/MAL entry, so no global-offset adjustment is
+    # needed — attempting one mis-resolved split-cour shows onto early episodes.
 
     accumulated_eps = 0
     
@@ -163,7 +122,7 @@ def get_discussion_link(anime, id, episode):
         offset = ((episode-1)//100)*100 if episode > 100 else 0
         BASE_URL = f'https://myanimelist.net/anime/{id}/{anime}/episode?offset={offset}'
         
-        response = requests.get(BASE_URL)
+        response = requests.get(BASE_URL, timeout=10)
         soup = BeautifulSoup(response.content, 'html.parser')
         table = soup.find('table',  {'class': 'episode_list'})
 
@@ -188,7 +147,7 @@ def fallback_forum_search(clean_title, local_ep):
     try:
         url = constants.MAL_FORUM_URL
         params = {'q': query, 'limit': 5}
-        response = requests.get(url, params=params, headers={'X-MAL-CLIENT-ID': CLIENT_ID})
+        response = requests.get(url, params=params, headers={'X-MAL-CLIENT-ID': CLIENT_ID}, timeout=10)
         
         if response.status_code == 200:
             topics = response.json().get('data', [])
@@ -208,7 +167,7 @@ def normalize_text(value):
 def scrape_forum_topic_html(discussion_id):
     try:
         topic_url = f"https://myanimelist.net/forum/?topicid={discussion_id}"
-        response = requests.get(topic_url)
+        response = requests.get(topic_url, timeout=10)
         response.raise_for_status()
 
         soup = BeautifulSoup(response.content, 'html.parser')
@@ -316,7 +275,7 @@ def get_discussion(anime_query, season, episode):
 
     # Fetch the forum posts
     mal_forum_url = f"https://api.myanimelist.net/v2/forum/topic/{discussion_id}?limit=100"
-    response = requests.get(mal_forum_url, headers={'X-MAL-CLIENT-ID': CLIENT_ID})
+    response = requests.get(mal_forum_url, headers={'X-MAL-CLIENT-ID': CLIENT_ID}, timeout=10)
     
     # Prefer the structured API response when MAL allows it.
     mal_data = response.json()
