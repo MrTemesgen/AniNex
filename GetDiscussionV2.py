@@ -14,8 +14,18 @@ CLIENT_ID = os.getenv('CLIENT_ID')
 
 def fetch_season_tree(search_term):
     res = requests.post(constants.ANILIST_API_URL, json={'query': constants.GRAPHQL_QUERY, 'variables': {'search': search_term}}, timeout=10)
+    res.raise_for_status()
     # AniList returns {"data": null, "errors": [...]} on error, so guard against None.
-    return (res.json().get('data') or {}).get('Media')
+    payload = res.json()
+    if not isinstance(payload, dict) or payload.get('errors'):
+        raise ValueError('Invalid AniList response')
+    data = payload.get('data')
+    if data is not None and not isinstance(data, dict):
+        raise ValueError('Invalid AniList data')
+    node = (data or {}).get('Media')
+    if node is not None and not isinstance(node, dict):
+        raise ValueError('Invalid AniList media')
+    return node
 
 # Small in-process cache so repeated chain walks (and repeat requests for popular shows)
 # don't re-hit AniList for the same node. Bounded to avoid unbounded growth on a long-lived dyno.
@@ -33,7 +43,7 @@ def fetch_node_relations(anilist_id):
         res = requests.post(constants.ANILIST_API_URL, json={'query': constants.GRAPHQL_NODE_QUERY, 'variables': {'id': anilist_id}}, timeout=10)
         node = (res.json().get('data') or {}).get('Media')
     except Exception as e:
-        current_app.logger.error(f"AniList node fetch failed for id {anilist_id}: {e}")
+        current_app.logger.warning("Discussion provider request failed.")
         return None
     if node:
         if len(_NODE_CACHE) >= _NODE_CACHE_MAX:
@@ -144,7 +154,7 @@ def fallback_mal_search(anime_query, season):
             if data:
                 return data[0]['node']['id']
     except Exception as e:
-        current_app.logger.error(f"Fallback MAL search failed for {search_term}: {e}")
+        current_app.logger.warning("Discussion provider request failed.")
         
     return None
 
@@ -158,7 +168,7 @@ def resolve_mal_id_with_split_cour(anime_query, season, episode):
     else:
         search_term = f"{anime_query} Season {season}"
         
-    current_app.logger.info(f"Hybrid search term: {search_term}")
+    current_app.logger.debug("Resolving episode discussion.")
     
     # 2. Fetch the starting node for this specific season
     current_node = fetch_season_tree(search_term)
@@ -175,12 +185,12 @@ def resolve_mal_id_with_split_cour(anime_query, season, episode):
         season_span = calculate_season_span(current_node)
         if target_ep > season_span:
             offset = calculate_global_offset(current_node)
-            current_app.logger.info(f"Episode {target_ep} exceeds season span {season_span}; treating as GLOBAL (prequel offset {offset}).")
+            current_app.logger.debug("Resolving episode discussion.")
             # Only subtract a sane offset; otherwise leave the number untouched and treat as local.
             if 0 < offset < target_ep:
                 target_ep -= offset
         else:
-            current_app.logger.info(f"Episode {target_ep} within season span {season_span}; treating as LOCAL.")
+            current_app.logger.debug("Resolving episode discussion.")
 
     accumulated_eps = 0
     
@@ -252,7 +262,7 @@ def get_discussion_link(anime, id, episode):
         return match.group(1) if match else None
         
     except Exception as e:
-        current_app.logger.error(f"Scraper failed for {anime}-{episode}: {e}")
+        current_app.logger.warning("Discussion provider request failed.")
         return None
 
 def fallback_forum_search(clean_title, local_ep):
@@ -267,10 +277,10 @@ def fallback_forum_search(clean_title, local_ep):
             topics = response.json().get('data', [])
             for topic in topics:
                 # Basic sanity check: ensure the episode number is actually in the title
-                if str(local_ep) in topic.get('title', ''):
+                if re.search(r'\bEpisode\s+' + re.escape(str(local_ep)) + r'\b', topic.get('title', ''), re.IGNORECASE):
                     return topic.get('id')
     except Exception as e:
-        current_app.logger.error(f"Fallback forum search failed: {e}")
+        current_app.logger.warning("Discussion provider request failed.")
     return None
 
 def normalize_text(value):
@@ -361,7 +371,7 @@ def scrape_forum_topic_html(discussion_id):
             'url': topic_url,
         }
     except Exception as e:
-        current_app.logger.error(f"Forum HTML scrape failed for topic {discussion_id}: {e}")
+        current_app.logger.warning("Discussion provider request failed.")
         return None
 
 # ---------------------------------------------------------
@@ -393,15 +403,20 @@ def get_discussion(anime_query, season, episode):
     
     # Prefer the structured API response when MAL allows it.
     mal_data = response.json()
+    if not isinstance(mal_data, dict):
+        raise ValueError('Invalid MAL response')
     if 'error' in mal_data:
-        current_app.logger.error(f"MAL API Error: {mal_data}")
+        current_app.logger.warning("Discussion provider request failed.")
         error_payload = mal_data.get('error', {})
         error_code = error_payload.get('error') if isinstance(error_payload, dict) else error_payload
         if error_code == 'forbidden':
-            current_app.logger.info(f"Falling back to HTML forum scrape for topic {discussion_id}")
+            current_app.logger.debug("Resolving episode discussion.")
             scraped_topic = scrape_forum_topic_html(discussion_id)
             if scraped_topic:
                 return jsonify(message=scraped_topic)
-        return jsonify(error=mal_data, message="MAL API rejected the discussion ID.")
+        return jsonify(error='upstream_unavailable', message="Discussion provider is unavailable. Please retry."), 502
         
-    return jsonify(message=mal_data.get('data', {}))
+    response.raise_for_status()
+    if not isinstance(mal_data.get('data'), dict):
+        raise ValueError('Missing MAL discussion data')
+    return jsonify(message=mal_data['data'])
