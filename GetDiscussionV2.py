@@ -419,4 +419,8 @@ def get_discussion(anime_query, season, episode):
     response.raise_for_status()
     if not isinstance(mal_data.get('data'), dict):
         raise ValueError('Missing MAL discussion data')
-    return jsonify(message=mal_data['data'])
+    topic = dict(mal_data['data'])
+    # MAL's detail payload omits the ID; expose the thread we actually resolved.
+    topic['id'] = int(discussion_id)
+    topic['url'] = f'https://myanimelist.net/forum/?topicid={discussion_id}'
+    return jsonify(message=topic)
