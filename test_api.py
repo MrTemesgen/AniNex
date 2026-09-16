@@ -63,6 +63,19 @@ class ApiTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     discussion.fetch_season_tree('Example')
 
+    def test_api_discussion_exposes_resolved_thread_link(self):
+        provider = Mock()
+        provider.json.return_value = {'data': {'title': 'Episode discussion', 'posts': []}}
+        with api.app.app_context(), \
+                patch.object(discussion, 'resolve_mal_id_with_split_cour', return_value=(123, 1, 'Example')), \
+                patch.object(discussion, 'get_discussion_link', return_value='1987654'), \
+                patch.object(discussion.requests, 'get', return_value=provider):
+            payload = discussion.get_discussion('Example', '1', 1).get_json()['message']
+        self.assertEqual(payload['id'], 1987654)
+        self.assertEqual(payload['url'], 'https://myanimelist.net/forum/?topicid=1987654')
+        self.assertEqual(payload['title'], 'Episode discussion')
+        self.assertEqual(payload['posts'], [])
+
 
 if __name__ == '__main__':
     unittest.main()
