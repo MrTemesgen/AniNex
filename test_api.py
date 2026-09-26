@@ -63,6 +63,49 @@ class ApiTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     discussion.fetch_season_tree('Example')
 
+    def test_anilist_explicit_not_found_is_a_catalog_miss(self):
+        response = Mock(status_code=404)
+        response.json.return_value = {'errors': [{'status': 404, 'message': 'Not Found.'}],
+                                      'data': {'Media': None}}
+        with patch.object(discussion.requests, 'post', return_value=response):
+            self.assertIsNone(discussion.fetch_season_tree('Black Clover Season 3'))
+
+    def test_anilist_other_errors_are_not_catalog_misses(self):
+        for status in [429, 500]:
+            response = Mock(status_code=status)
+            response.json.return_value = {'errors': [{'status': status}], 'data': None}
+            response.raise_for_status.side_effect = requests.HTTPError()
+            with patch.object(discussion.requests, 'post', return_value=response):
+                with self.assertRaises(requests.HTTPError):
+                    discussion.fetch_season_tree('Example')
+
+    def test_streaming_season_uses_base_catalog_absolute_episode(self):
+        node = {'idMal': 34572, 'format': 'TV', 'episodes': 170,
+                'title': {'romaji': 'Black Clover', 'english': 'Black Clover'}}
+        with api.app.app_context(), patch.object(discussion, 'fetch_season_tree', side_effect=[None, node]) as fetch:
+            self.assertEqual(discussion.resolve_mal_id_with_split_cour('Black Clover', '3', 130),
+                             (34572, 130, 'Black_Clover'))
+            self.assertEqual([call.args[0] for call in fetch.call_args_list],
+                             ['Black Clover Season 3', 'Black Clover'])
+
+    def test_base_fallback_rejects_wrong_title_format_or_episode_range(self):
+        base = {'idMal': 34572, 'format': 'TV', 'episodes': 170,
+                'title': {'romaji': 'Black Clover'}}
+        for changes in [{'episodes': 12}, {'format': 'MOVIE'},
+                        {'title': {'romaji': 'Black Clover Special'}}, {'episodes': None}]:
+            with self.subTest(changes=changes), api.app.app_context(), \
+                    patch.object(discussion, 'fetch_season_tree', side_effect=[None, dict(base, **changes)]), \
+                    patch.object(discussion, 'fallback_mal_search', return_value=None):
+                self.assertIsNone(discussion.resolve_mal_id_with_split_cour('Black Clover', '3', 130)[0])
+
+    def test_existing_season_keeps_its_own_episode_mapping(self):
+        node = {'idMal': 123, 'format': 'TV', 'episodes': 12,
+                'title': {'romaji': 'Example Season 3'}}
+        with api.app.app_context(), patch.object(discussion, 'fetch_season_tree', return_value=node) as fetch:
+            self.assertEqual(discussion.resolve_mal_id_with_split_cour('Example', '3', 5),
+                             (123, 5, 'Example_Season_3'))
+            fetch.assert_called_once_with('Example Season 3')
+
     def test_api_discussion_exposes_resolved_thread_link(self):
         provider = Mock()
         provider.json.return_value = {'data': {'title': 'Episode discussion', 'posts': []}}
