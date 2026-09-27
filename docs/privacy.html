@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="How AniNex handles episode information, discussion content, and service logs.">
+  <meta name="referrer" content="no-referrer">
+  <title>Privacy policy · AniNex</title>
+  <style>
+    :root{color-scheme:light;--ink:#18212b;--muted:#53606d;--accent:#ac4200;--line:#e1e5e9}
+    *{box-sizing:border-box}body{margin:0;background:#f6f7f9;color:var(--ink);font:17px/1.7 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+    main{max-width:820px;margin:48px auto;padding:44px 48px;background:white;border:1px solid var(--line);border-radius:16px}
+    .brand{font-size:23px;font-weight:800;letter-spacing:-.5px}.brand span{color:var(--accent)}
+    h1{font-size:clamp(30px,5vw,42px);line-height:1.2;margin:24px 0 10px;letter-spacing:-1px}h2{font-size:22px;line-height:1.4;margin:34px 0 10px}
+    p{margin:12px 0}.meta,footer{color:var(--muted);font-size:14px}.summary{background:#fff7ef;border-left:4px solid #d75a09;padding:16px 20px;margin:28px 0}
+    a{color:var(--accent);text-underline-offset:3px;overflow-wrap:anywhere}a:focus-visible{outline:3px solid #d75a09;outline-offset:4px}
+    li{margin:8px 0}ul{padding-left:23px}footer{border-top:1px solid var(--line);margin-top:36px;padding-top:20px}
+    @media(max-width:600px){main{margin:0;padding:28px 22px;border:0;border-radius:0}body{background:white}}
+    @media print{body{background:white}main{margin:0;padding:0;border:0;max-width:none}}
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div class="brand">Ani<span>Nex</span></div>
+    <h1>Privacy policy</h1>
+    <p class="meta">Last updated: September 27, 2026 · Chrome and Firefox extensions</p>
+  </header>
+  <div class="summary">AniNex uses the current Crunchyroll episode’s title, season, and episode number to retrieve matching MyAnimeList discussions. It does not access your browser’s stored history or monitor unrelated websites.</div>
+
+  <h2>What AniNex does</h2>
+  <p>AniNex is an independent browser extension that displays MyAnimeList episode discussions on Crunchyroll. This policy covers the extension and its discussion service. AniNex is not affiliated with Crunchyroll, MyAnimeList, or AniList.</p>
+
+  <h2>Information we handle</h2>
+  <ul>
+    <li><strong>Episode information:</strong> the anime title, season number, and episode number read from a supported Crunchyroll page. While AniNex is enabled, it automatically sends these values to the AniNex discussion service to find matching comments. This information reveals which episode you are viewing.</li>
+    <li><strong>Connection and service logs:</strong> hosting infrastructure receives and logs IP addresses, request times, browser user-agent information, API paths, response statuses, and timing information. Requests to the discussion service contain episode information; the current application’s cache logs record only outcome categories, not episode titles, URLs, or user identifiers.</li>
+    <li><strong>Public discussion content:</strong> comments, author names, avatars, links, and episode ratings retrieved from MyAnimeList and displayed in the discussion panel.</li>
+    <li><strong>Support messages:</strong> if you email us, we receive your email address and the information you choose to include to respond to your request.</li>
+  </ul>
+  <p>The extension does not send Crunchyroll passwords, account cookies, payment details, or user-entered form data to the discussion API. It does not access Chrome’s or Firefox’s stored browsing-history database. Its API requests omit browser credentials and the page referrer. AniNex has no user account system, advertising SDK, or analytics SDK.</p>
+
+  <h2>How information is used and shared</h2>
+  <p>Episode information is used to resolve the matching anime and discussion thread and return comments. Operational logs support running and securing this service. Support messages are used to respond to you.</p>
+  <ul>
+    <li><strong>AniNex / Heroku:</strong> the discussion service at <a href="https://aninex-60a22ea8db43.herokuapp.com/">aninex-60a22ea8db43.herokuapp.com</a> receives the episode request. Heroku hosts it and processes connection and request logs.</li>
+    <li><strong>AniList and MyAnimeList:</strong> the backend sends title searches, anime identifiers, episode lookups, or discussion identifiers to resolve and retrieve public discussions. These backend requests originate from our server; the application does not forward the extension user’s IP address to these services.</li>
+    <li><strong>External image hosts:</strong> displaying forum images and avatars can send your IP address and ordinary connection information directly to their hosts. Browser settings determine whether existing cookies are sent. AniNex suppresses the page referrer on these images.</li>
+    <li><strong>Linked websites:</strong> opening a MyAnimeList, YouTube, or other external link visits that service under its own privacy practices. YouTube links do not automatically load an embedded player.</li>
+    <li><strong>GitHub Pages:</strong> GitHub hosts this policy page and may log visitors’ IP addresses for security. This page contains no added analytics, external fonts, embedded media, or tracking scripts.</li>
+  </ul>
+
+  <h2>Retention and caching</h2>
+  <p>The configured Heroku log history is limited to a maximum of 1,500 lines or up to one week, whichever limit is reached first. This describes the service’s accessible log history; third-party providers govern their own records under their policies.</p>
+  <p>The backend temporarily caches public episode-to-discussion mappings for up to 10 minutes and parsed forum posts for up to one minute. These caches are keyed by public anime or topic identifiers, not individual viewers. They are held in bounded server memory, become ineligible for reuse at expiry, are removed on subsequent cache access, and are cleared when the worker restarts. The application also keeps a bounded in-memory cache of public anime relationships for episode resolution.</p>
+  <p>Support correspondence is handled through email. Contact us if you would like your support correspondence deleted, subject to applicable retention obligations. Third-party services have their own retention practices.</p>
+
+  <h2>Your choices</h2>
+  <p>Disable or remove AniNex in your browser’s extension manager to stop future requests from the extension. No AniNex account is required. For questions about information already handled, or to request access or deletion where applicable, contact us below.</p>
+  <p>In-video timed comments are disabled and excluded from the current release. The release does not create or synchronize timed reactions and does not run in private or incognito windows. Data saved by an earlier prototype is not automatically erased by an update.</p>
+
+  <h2>Security and Limited Use</h2>
+  <p>The extension communicates with the discussion API over HTTPS. We limit the information sent to the fields needed for episode discussions.</p>
+  <p>AniNex’s use of user data complies with the <a href="https://developer.chrome.com/docs/webstore/program-policies/user-data-faq">Chrome Web Store User Data Policy</a>, including the <a href="https://developer.chrome.com/docs/webstore/program-policies/limited-use">Limited Use requirements</a>. User data is used only to provide or improve the extension’s disclosed discussion functionality and its related operation and security.</p>
+  <p>We do not sell user data, use it for personalized advertising, transfer it to data brokers, or use it to determine creditworthiness or for lending. Transfers are limited to providing this functionality, legal requirements, security needs, or a business transfer with prior explicit user consent. Human access to user data is limited to explicit consent for specific information, security investigations, legal requirements, or aggregated and anonymized internal operations.</p>
+
+  <h2>Contact and policy updates</h2>
+  <p>Contact the AniNex developer at <a href="mailto:ani-nex-support@aninex.mozmail.com">ani-nex-support@aninex.mozmail.com</a> with privacy questions or requests. Please avoid sending passwords or other unnecessary sensitive information.</p>
+  <p>We will update this page when these practices change and revise the date above. Where required, changes will also be disclosed in the extension or store listing.</p>
+  <footer>AniNex · Episode discussions on Crunchyroll</footer>
+</main>
+</body>
+</html>
