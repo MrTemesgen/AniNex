@@ -15,6 +15,22 @@ def response(body=b'valid', headers=None):
 
 
 class CacheTests(unittest.TestCase):
+    def test_logs_outcomes_without_sensitive_values(self):
+        cache = HtmlCache()
+        key = ('episodes', 'PRIVATE_TITLE_OR_URL', 100)
+        with self.assertLogs('aninex.scrape_cache', level='INFO') as logs:
+            cache.get(key, 60, lambda: response(), bool)
+            cache.get(key, 60, lambda: response(), bool)
+            cache.get(('topic', 123), 60, lambda: response(headers={'Cache-Control': 'no-cache'}), bool)
+            with self.assertRaises(requests.Timeout):
+                cache.get(('topic', 456), 60, Mock(side_effect=requests.Timeout('PRIVATE_EXCEPTION')), bool)
+        output = '\n'.join(logs.output)
+        for expected in ['event=miss', 'event=store', 'event=hit',
+                         'event=skip kind=topic reason=no-cache', 'event=failure kind=topic stage=fetch']:
+            self.assertIn(expected, output)
+        for secret in ['PRIVATE_TITLE_OR_URL', 'PRIVATE_EXCEPTION', '123', '456']:
+            self.assertNotIn(secret, output)
+
     def test_hit_expiry_and_lru_memory_bounds(self):
         now = [0]
         cache = HtmlCache(max_entries=2, max_bytes=6, clock=lambda: now[0])
