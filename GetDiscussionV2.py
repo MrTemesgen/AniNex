@@ -5,6 +5,7 @@ import re
 import os
 import constants
 from urllib.parse import urljoin
+from scrape_cache import html_cache
 
 CLIENT_ID = os.getenv('CLIENT_ID')
 
@@ -14,9 +15,18 @@ CLIENT_ID = os.getenv('CLIENT_ID')
 
 def fetch_season_tree(search_term):
     res = requests.post(constants.ANILIST_API_URL, json={'query': constants.GRAPHQL_QUERY, 'variables': {'search': search_term}}, timeout=10)
-    res.raise_for_status()
     # AniList returns {"data": null, "errors": [...]} on error, so guard against None.
     payload = res.json()
+    # A missing catalog entry is not a provider outage. Only accept AniList's
+    # explicit not-found shape; rate limits and other errors must still fail.
+    if isinstance(payload, dict):
+        errors = payload.get('errors')
+        data = payload.get('data')
+        if (res.status_code in (200, 404) and isinstance(errors, list) and errors
+                and all(isinstance(error, dict) and error.get('status') == 404 for error in errors)
+                and (data is None or data == {'Media': None})):
+            return None
+    res.raise_for_status()
     if not isinstance(payload, dict) or payload.get('errors'):
         raise ValueError('Invalid AniList response')
     data = payload.get('data')
@@ -172,6 +182,18 @@ def resolve_mal_id_with_split_cour(anime_query, season, episode):
     
     # 2. Fetch the starting node for this specific season
     current_node = fetch_season_tree(search_term)
+    if not current_node and season_str.isdigit() and int(season_str) > 1:
+        # Streaming services can divide one catalog entry into several seasons.
+        # Preserve the absolute episode only when the base title matches exactly
+        # and its published episode count covers the requested number.
+        base_node = fetch_season_tree(anime_query)
+        if (base_node and base_node.get('format') == 'TV'
+                and _normalize_title(anime_query) in {
+                    _normalize_title(value) for value in base_node.get('title', {}).values() if value
+                }
+                and 0 < target_ep <= _tv_episode_count(base_node)):
+            return base_node.get('idMal'), target_ep, (
+                base_node['title'].get('romaji') or anime_query).replace(' ', '_')
     
     if not current_node:
         return fallback_mal_search(anime_query, season), target_ep, search_term.replace(' ', '_')
@@ -246,8 +268,11 @@ def get_discussion_link(anime, id, episode):
         offset = ((episode-1)//100)*100 if episode > 100 else 0
         BASE_URL = f'https://myanimelist.net/anime/{id}/{anime}/episode?offset={offset}'
         
-        response = requests.get(BASE_URL, timeout=10)
-        soup = BeautifulSoup(response.content, 'html.parser')
+        content = html_cache.get(
+            ('episodes', int(id), offset), 600,
+            lambda: requests.get(BASE_URL, timeout=10),
+            lambda body: bool(BeautifulSoup(body, 'html.parser').select('table.episode_list tr td a[href*="topicid="]')))
+        soup = BeautifulSoup(content, 'html.parser')
         table = soup.find('table',  {'class': 'episode_list'})
 
         if table is None: return None
@@ -291,10 +316,12 @@ def normalize_text(value):
 def scrape_forum_topic_html(discussion_id):
     try:
         topic_url = f"https://myanimelist.net/forum/?topicid={discussion_id}"
-        response = requests.get(topic_url, timeout=10)
-        response.raise_for_status()
-
-        soup = BeautifulSoup(response.content, 'html.parser')
+        content = html_cache.get(
+            ('topic', int(discussion_id)), 60,
+            lambda: requests.get(topic_url, timeout=10),
+            lambda body: any(node.get_text(strip=True) for node in BeautifulSoup(body, 'html.parser').select(
+                '.forum-topic-message.message, table.body, .forum-post-message, .js-forum-post-body')))
+        soup = BeautifulSoup(content, 'html.parser')
         title = normalize_text(soup.title.get_text()) if soup.title else f"MAL Topic {discussion_id}"
 
         post_selectors = [
