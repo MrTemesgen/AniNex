@@ -31,3 +31,25 @@ do not expect this release to reduce sequential MAL requests under those headers
 Run `python -m unittest test_api test_scrape_cache` to verify behavior.
 No new runtime dependency or browser release is required. Deploy the backend
 including `scrape_cache.py` to activate the change in production.
+
+## Heroku logs
+
+Search the application logs for `scrape_cache`. This module emits INFO records
+to stderr (captured by Heroku), independently of Flask's default warning level.
+Examples:
+
+```text
+scrape_cache event=miss kind=episodes
+scrape_cache event=skip kind=episodes reason=no-cache
+scrape_cache event=store kind=topic ttl_seconds=60 bytes=12345
+scrape_cache event=hit kind=topic
+```
+
+`shared_wait` and `shared_success` identify a request that reused an in-flight
+fetch; `shared_failure` reports failure or timeout while waiting. `failure`
+includes a fixed stage (`fetch`, `http_status`, `validation`, or `storage`).
+Skip reasons are `no-cache`, `no-store`, `private`, `expired`, `disabled`, or
+`oversize`. Categories are `episodes`, `topic`, or `other`. Titles, IDs, URLs,
+HTML, user information and exception messages are excluded. These events are
+worker-level diagnostics, not a per-request correlation trace. A `hit` proves
+reuse of cached HTML; `skip reason=no-cache` proves no page was stored.
