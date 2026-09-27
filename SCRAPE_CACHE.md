@@ -1,55 +1,66 @@
-# HTML scrape cache
+# Parsed scrape-result cache
 
-The active `GetDiscussionV2.py` scraping paths use `scrape_cache.py`.
+The active `GetDiscussionV2.py` scrapers use `ScrapeResultCache` in
+`scrape_cache.py`. This memoizes derived application data, not HTTP responses.
+Raw HTML, response headers, and BeautifulSoup objects are not retained.
 
-- Episode-list pages: 600 seconds, keyed by MAL anime ID and pagination offset.
-  Requests for different episodes on the same page reuse the HTML.
-- Forum HTML fallback: 60 seconds, keyed by topic ID. New posts may take up to
-  one minute to appear through the HTML fallback.
-- Only HTTP 200 pages with recognizable discussion markup are admitted.
-  Exceptions, challenge pages, missing markup, and unsuccessful responses are not cached.
-- Upstream `private`, `no-store`, and `no-cache` directives prevent storage.
-  `max-age` and `Age` can shorten the application TTL.
-- Concurrent requests for one key share an in-flight fetch; no lock is held
-  during network I/O. Waiters have a 15-second deadline.
-- LRU storage is bounded to 256 pages / 16 MiB of HTML per process, with a
-  2 MiB per-page admission limit. Parsing and active network requests use
-  additional temporary memory. Expired entries are removed on the next lookup.
-- Cached bytes contain public upstream HTML, not incoming request headers or
-  extension-user identifiers. Cache keys use numeric provider IDs.
+## Retention and freshness
 
-This is per Gunicorn worker and resets on restart/deploy. It does not provide a
-shared cross-worker/dyno cache; that would require shared storage such as Redis.
-It does not cache API responses or alter the unused legacy `GetDiscussion.py`.
-It does not serve stale pages after expiration or provider failure.
+- Episode-to-topic mappings: 600 seconds, keyed by MAL anime ID and page offset.
+  Different episodes on the same page share a mapping. Missing discussion links
+  are not stored as successful entries; the normal forum API fallback still runs.
+- Parsed forum topics/posts: 60 seconds, keyed by topic ID. New or edited posts
+  may take up to a minute to appear through this fallback.
+- These explicit application TTLs apply even when page responses carry
+  `no-cache` or `max-age=0`. This deliberately changes the earlier implementation,
+  which treated page HTTP freshness directives as a reason to disable caching.
+  It does not revalidate the upstream page during the application TTL.
+- `private` and `no-store` still prevent retention as a conservative safeguard.
+- Only successfully parsed nonempty results from HTTP 200 responses are admitted.
+  Failures, challenge pages without usable content, and empty parse results are
+  retried on subsequent requests. Expired results are not served on errors.
 
-Live validation on September 26, 2026: MAL's episode and forum pages both returned
-`Cache-Control: no-cache`. Repeated sequential requests therefore fetched fresh
-pages and stored no entries. TTL reuse is conditional on upstream cache directives;
-do not expect this release to reduce sequential MAL requests under those headers.
+## Bounds and concurrency
 
-Run `python -m unittest test_api test_scrape_cache` to verify behavior.
-No new runtime dependency or browser release is required. Deploy the backend
-including `scrape_cache.py` to activate the change in production.
+- LRU: at most 256 results / 16 MiB of serialized JSON per worker, with a
+  2 MiB admission limit per result. Active fetches, parsing, and returned objects
+  require additional temporary memory. Expired entries are removed on lookup.
+- Concurrent requests for the same key share a fetch/parse operation. Waiters
+  have a 15-second deadline; the network fetch has a 10-second requests timeout.
+- Serialization gives each caller an independent copy, protecting shared results.
+- Keys use public provider IDs. No extension-user identifiers or request headers
+  are cached. Forum snapshots include public authors and posts as displayed.
+- State is per Gunicorn worker and is lost on restart/deploy. It is not shared
+  across dynos. API calls (AniList and MAL forum API) remain uncached, so a scrape
+  cache hit does not imply that the entire discussion request avoids network I/O.
+- The unused legacy `GetDiscussion.py` is unchanged. No new dependency is needed.
 
 ## Heroku logs
 
-Search the application logs for `scrape_cache`. This module emits INFO records
-to stderr (captured by Heroku), independently of Flask's default warning level.
-Examples:
+Search application logs for `scrape_cache`. INFO records go to stderr, captured
+by Heroku independently of Flask's default warning level. For a repeated request
+within the TTL on the same worker, expect:
 
 ```text
 scrape_cache event=miss kind=episodes
-scrape_cache event=skip kind=episodes reason=no-cache
-scrape_cache event=store kind=topic ttl_seconds=60 bytes=12345
-scrape_cache event=hit kind=topic
+scrape_cache event=store kind=episodes ttl_seconds=600 bytes=1121
+scrape_cache event=hit kind=episodes
 ```
 
-`shared_wait` and `shared_success` identify a request that reused an in-flight
-fetch; `shared_failure` reports failure or timeout while waiting. `failure`
-includes a fixed stage (`fetch`, `http_status`, `validation`, or `storage`).
-Skip reasons are `no-cache`, `no-store`, `private`, `expired`, `disabled`, or
-`oversize`. Categories are `episodes`, `topic`, or `other`. Titles, IDs, URLs,
-HTML, user information and exception messages are excluded. These events are
-worker-level diagnostics, not a per-request correlation trace. A `hit` proves
-reuse of cached HTML; `skip reason=no-cache` proves no page was stored.
+`shared_wait` / `shared_success` indicate reuse of an in-flight fetch;
+`shared_failure` reports a wait failure. `failure` includes only a fixed stage:
+`fetch`, `http_status`, `parse`, or `storage`. Skips report `private`, `no-store`,
+`expired`, `disabled`, or `oversize`. Logs exclude keys, IDs, URLs, titles, HTML,
+user information, and exception messages. These are worker-level diagnostics.
+
+## Validation
+
+Run `python -m unittest test_api test_scrape_cache` (23 tests).
+Local patched code tested against live MAL: two reads of Black Clover's episode
+page and two reads of Jujutsu Kaisen's forum topic produced two network fetches
+in total, with `miss`, `store`, then `hit` for each category. Both upstream pages
+returned `Cache-Control: no-cache`. Correct episode 130 mapping and 50 forum
+posts were preserved. This verifies local behavior, not the deployed service.
+
+Deploy all changed backend files before checking Heroku for the new hit behavior.
+No extension release is required.

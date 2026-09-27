@@ -1,10 +1,11 @@
-"""Bounded per-worker cache of validated public HTML, with concurrent miss sharing."""
+"""Bounded application cache of parsed public scrape results, not HTTP responses."""
 from collections import OrderedDict
 from concurrent.futures import Future
 from threading import Lock
 from time import monotonic
 import re
 import logging
+import json
 
 
 logger = logging.getLogger('aninex.scrape_cache')
@@ -24,7 +25,7 @@ def log_cache(event, key, **fields):
                 ' '.join(f'{name}={value}' for name, value in fields.items()))
 
 
-class HtmlCache:
+class ScrapeResultCache:
     def __init__(self, max_entries=256, max_bytes=16 * 1024 * 1024, clock=monotonic):
         self.max_entries = max_entries
         self.max_bytes = max_bytes
@@ -34,7 +35,7 @@ class HtmlCache:
         self.size = 0
         self.lock = Lock()
 
-    def get(self, key, ttl, fetch, validate):
+    def get(self, key, ttl, fetch, parse):
         with self.lock:
             now = self.clock()
             for old in list(self.entries):
@@ -43,7 +44,7 @@ class HtmlCache:
             if key in self.entries:
                 self.entries.move_to_end(key)
                 log_cache('hit', key)
-                return self.entries[key][1]
+                return json.loads(self.entries[key][1])
             future = self.pending.get(key)
             owner = future is None
             if owner:
@@ -53,7 +54,7 @@ class HtmlCache:
             try:
                 result = future.result(timeout=15)
                 log_cache('shared_success', key)
-                return result
+                return json.loads(result)
             except Exception:
                 log_cache('shared_failure', key)
                 raise
@@ -63,18 +64,19 @@ class HtmlCache:
             response = fetch()
             stage = 'http_status'
             response.raise_for_status()
-            stage = 'validation'
-            body = response.content
-            if response.status_code != 200 or not validate(body):
+            stage = 'parse'
+            if response.status_code != 200:
                 raise ValueError('Invalid scrape response')
-            # Honor upstream restrictions, and never extend freshness past our TTL.
+            result = parse(response.content)
+            if not result:
+                raise ValueError('No usable scrape result')
+            # Store only derived application data. HTTP no-cache/max-age describe
+            # reuse of the page response; these results use our explicit TTL.
+            # Conservatively decline retention for private/no-store responses.
             directives = response.headers.get('Cache-Control', '').lower()
-            blocked = re.search(r'(?:^|,)\s*(no-store|private|no-cache)\b', directives)
+            blocked = re.search(r'(?:^|,)\s*(no-store|private)\b', directives)
             cacheable = not blocked
-            age = response.headers.get('Age', '0')
-            match = re.search(r'(?:^|,)\s*max-age\s*=\s*"?(\d+)', directives)
-            if match:
-                ttl = min(ttl, max(0, int(match[1]) - (int(age) if age.isdigit() else 0)))
+            body = json.dumps(result, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
             stage = 'storage'
             stored = False
             with self.lock:
@@ -93,7 +95,7 @@ class HtmlCache:
                           else 'disabled' if self.max_entries <= 0 else 'oversize')
                 log_cache('skip', key, reason=reason)
             future.set_result(body)
-            return body
+            return json.loads(body)
         except BaseException as error:
             log_cache('failure', key, stage=stage)
             future.set_exception(error)
@@ -103,4 +105,4 @@ class HtmlCache:
                 self.pending.pop(key, None)
 
 
-html_cache = HtmlCache()
+scrape_result_cache = ScrapeResultCache()
