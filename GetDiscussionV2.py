@@ -5,7 +5,7 @@ import re
 import os
 import constants
 from urllib.parse import urljoin
-from scrape_cache import html_cache
+from scrape_cache import scrape_result_cache
 
 CLIENT_ID = os.getenv('CLIENT_ID')
 
@@ -262,29 +262,40 @@ def resolve_mal_id_with_split_cour(anime_query, season, episode):
 # 3. SCRAPERS & FORUM SEARCH
 # ---------------------------------------------------------
 
+def parse_episode_links(content, offset):
+    """Retain only episode-to-topic IDs, never the upstream page."""
+    soup = BeautifulSoup(content, 'html.parser')
+    table = soup.find('table', {'class': 'episode_list'})
+    if table is None:
+        return None
+    links = {}
+    for number, row in enumerate(table.find_all('tr')[1:], start=offset + 1):
+        cells = row.find_all('td')
+        if not cells:
+            continue
+        # Use the explicit episode column when present; retain the old positional
+        # interpretation for tables without one. Missing links never shift rows.
+        label = cells[0].get_text(strip=True)
+        episode = int(label) if label.isdigit() else number
+        for link in cells[-1].find_all('a', href=True):
+            match = re.search(r'(?:[?&])topicid=(\d+)', link['href'])
+            if match:
+                links[str(episode)] = match[1]
+                break
+    return links or None
+
+
 def get_discussion_link(anime, id, episode):
     try:
         episode = int(episode)
         offset = ((episode-1)//100)*100 if episode > 100 else 0
         BASE_URL = f'https://myanimelist.net/anime/{id}/{anime}/episode?offset={offset}'
         
-        content = html_cache.get(
+        links = scrape_result_cache.get(
             ('episodes', int(id), offset), 600,
             lambda: requests.get(BASE_URL, timeout=10),
-            lambda body: bool(BeautifulSoup(body, 'html.parser').select('table.episode_list tr td a[href*="topicid="]')))
-        soup = BeautifulSoup(content, 'html.parser')
-        table = soup.find('table',  {'class': 'episode_list'})
-
-        if table is None: return None
-
-        remainder = (episode % 100)
-        idx = 100 if remainder == 0 else remainder 
-        row = table.find_all('tr')[idx]
-        link = row.find_all(['td', 'th'])[-1].find('a')['href']
-        
-        # --- NEW: Strict Regex Extraction ---
-        match = re.search(r'topicid=(\d+)', link)
-        return match.group(1) if match else None
+            lambda body: parse_episode_links(body, offset))
+        return links.get(str(episode))
         
     except Exception as e:
         current_app.logger.warning("Discussion provider request failed.")
@@ -313,93 +324,98 @@ def normalize_text(value):
         return ""
     return re.sub(r'\s+', ' ', value).strip()
 
+def parse_forum_topic(content, discussion_id):
+    topic_url = f"https://myanimelist.net/forum/?topicid={discussion_id}"
+    soup = BeautifulSoup(content, 'html.parser')
+    title = normalize_text(soup.title.get_text()) if soup.title else f"MAL Topic {discussion_id}"
+
+    post_selectors = [
+        'div.message-wrapper',
+        'table.body[id^="message"]',
+        'div.forum-topic-message.message',
+        'div.forum-post',
+        'div.js-forum-topic-post',
+        'tr[id^="topicRow"]',
+        'div[id^="message"]',
+        'table.forum_board_view tr',
+    ]
+
+    containers = []
+    for selector in post_selectors:
+        containers = soup.select(selector)
+        if containers:
+            break
+
+    posts = []
+    seen_keys = set()
+
+    for index, container in enumerate(containers, start=1):
+        profile_link = container.select_one('a[href*="/profile/"], a[href*="profile.php"]')
+        body_node = container.select_one(
+            '.forum-topic-message.message, table.body td, table.body, .message, .content, .forum-post-message, .js-forum-post-body, [id^="postMessage"]'
+        )
+
+        body_text = normalize_text(body_node.get_text(" ", strip=True) if body_node else container.get_text(" ", strip=True))
+        if not body_text:
+            continue
+
+        username = normalize_text(profile_link.get_text(" ", strip=True) if profile_link else "")
+        author_href = profile_link.get('href') if profile_link else None
+
+        time_node = container.select_one('time, .date, .forum-post-date, .message-header .date, small')
+        created_at = normalize_text(
+            (time_node.get('datetime') if time_node and time_node.has_attr('datetime') else time_node.get_text(" ", strip=True))
+            if time_node else ""
+        )
+
+        post_anchor = (
+            container.get('id')
+            or (body_node.get('id') if body_node else None)
+            or (container.select_one('table.body[id]')['id'] if container.select_one('table.body[id]') else None)
+            or f"post-{index}"
+        )
+        dedupe_key = (username, body_text[:120])
+        if dedupe_key in seen_keys:
+            continue
+        seen_keys.add(dedupe_key)
+
+        posts.append({
+            'id': post_anchor,
+            'number': len(posts) + 1,
+            'created_at': created_at,
+            'created_by': {
+                'name': username,
+                'forum_avator': '',
+                'href': urljoin(topic_url, author_href) if author_href else ''
+            },
+            'body': body_text,
+        })
+
+    if not posts:
+        return None
+
+    return {
+        'id': int(discussion_id),
+        'title': title,
+        'num_of_posts': len(posts),
+        'posts': posts,
+        'source': 'html_scrape',
+        'url': topic_url,
+    }
+
+
 def scrape_forum_topic_html(discussion_id):
     try:
-        topic_url = f"https://myanimelist.net/forum/?topicid={discussion_id}"
-        content = html_cache.get(
-            ('topic', int(discussion_id)), 60,
+        topic_id = int(discussion_id)
+        topic_url = f"https://myanimelist.net/forum/?topicid={topic_id}"
+        return scrape_result_cache.get(
+            ('topic', topic_id), 60,
             lambda: requests.get(topic_url, timeout=10),
-            lambda body: any(node.get_text(strip=True) for node in BeautifulSoup(body, 'html.parser').select(
-                '.forum-topic-message.message, table.body, .forum-post-message, .js-forum-post-body')))
-        soup = BeautifulSoup(content, 'html.parser')
-        title = normalize_text(soup.title.get_text()) if soup.title else f"MAL Topic {discussion_id}"
-
-        post_selectors = [
-            'div.message-wrapper',
-            'table.body[id^="message"]',
-            'div.forum-topic-message.message',
-            'div.forum-post',
-            'div.js-forum-topic-post',
-            'tr[id^="topicRow"]',
-            'div[id^="message"]',
-            'table.forum_board_view tr',
-        ]
-
-        containers = []
-        for selector in post_selectors:
-            containers = soup.select(selector)
-            if containers:
-                break
-
-        posts = []
-        seen_keys = set()
-
-        for index, container in enumerate(containers, start=1):
-            profile_link = container.select_one('a[href*="/profile/"], a[href*="profile.php"]')
-            body_node = container.select_one(
-                '.forum-topic-message.message, table.body td, table.body, .message, .content, .forum-post-message, .js-forum-post-body, [id^="postMessage"]'
-            )
-
-            body_text = normalize_text(body_node.get_text(" ", strip=True) if body_node else container.get_text(" ", strip=True))
-            if not body_text:
-                continue
-
-            username = normalize_text(profile_link.get_text(" ", strip=True) if profile_link else "")
-            author_href = profile_link.get('href') if profile_link else None
-
-            time_node = container.select_one('time, .date, .forum-post-date, .message-header .date, small')
-            created_at = normalize_text(
-                (time_node.get('datetime') if time_node and time_node.has_attr('datetime') else time_node.get_text(" ", strip=True))
-                if time_node else ""
-            )
-
-            post_anchor = (
-                container.get('id')
-                or (body_node.get('id') if body_node else None)
-                or (container.select_one('table.body[id]')['id'] if container.select_one('table.body[id]') else None)
-                or f"post-{index}"
-            )
-            dedupe_key = (username, body_text[:120])
-            if dedupe_key in seen_keys:
-                continue
-            seen_keys.add(dedupe_key)
-
-            posts.append({
-                'id': post_anchor,
-                'number': len(posts) + 1,
-                'created_at': created_at,
-                'created_by': {
-                    'name': username,
-                    'forum_avator': '',
-                    'href': urljoin(topic_url, author_href) if author_href else ''
-                },
-                'body': body_text,
-            })
-
-        if not posts:
-            return None
-
-        return {
-            'id': int(discussion_id),
-            'title': title,
-            'num_of_posts': len(posts),
-            'posts': posts,
-            'source': 'html_scrape',
-            'url': topic_url,
-        }
-    except Exception as e:
+            lambda body: parse_forum_topic(body, topic_id))
+    except Exception:
         current_app.logger.warning("Discussion provider request failed.")
         return None
+
 
 # ---------------------------------------------------------
 # 4. MAIN ENDPOINT
