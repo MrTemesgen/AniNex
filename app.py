@@ -1,13 +1,16 @@
-from flask import Flask, jsonify, current_app
+from flask import Flask, Response, jsonify, current_app
 from GetDiscussionV2 import get_discussion
-from flask_cors import CORS
 from flask import request
+import json
+import os
 import re
 import requests
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 4096
-CORS(app)
+# No CORS: the extension calls this API from its background script, which host
+# permissions exempt from CORS. Allowing every origin only let arbitrary websites use
+# this service (and its MAL/AniList quota) as a proxy.
 @app.route('/')
 def home():
     return jsonify(message="Hello from AniNex!")
@@ -33,6 +36,18 @@ def getDiscussionPayload():
         current_app.logger.warning('Discussion provider returned an unavailable or invalid response.')
         return jsonify(error='upstream_unavailable', message='Discussion service is unavailable. Please retry.'), 502
 
+DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data.json')
+_data_body = None
+
+
+@app.route('/data')
+def get_data():
+    # data.json is ~5 MB; parse and serialize it once per process, not per request.
+    global _data_body
+    if _data_body is None:
+        with open(DATA_PATH, 'r', encoding='utf-8') as f:
+            _data_body = json.dumps(json.load(f), separators=(',', ':'))
+    return Response(_data_body, mimetype='application/json')
 
 if __name__ == '__main__':
     app.run()
