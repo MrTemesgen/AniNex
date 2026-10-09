@@ -12,8 +12,8 @@ GRAPHQL_QUERY = """
       nextAiringEpisode { episode }
     }
 
-    query ($search: String) {
-      Media (search: $search, type: ANIME, sort: [SEARCH_MATCH, START_DATE]) {
+    query ($id: Int) {
+      Media (id: $id, type: ANIME) {
         ...animeFields
         relations {
           edges {
@@ -51,6 +51,22 @@ GRAPHQL_QUERY = """
     }
 """
 
+# Lists the best search candidates so the resolver can choose the entry whose title
+# actually matches, instead of trusting AniList's first fuzzy match (which can be a spin-off).
+GRAPHQL_SEARCH_QUERY = """
+    query ($search: String) {
+      Page (perPage: 10) {
+        media (search: $search, type: ANIME, sort: [SEARCH_MATCH, START_DATE]) {
+          id
+          idMal
+          format
+          popularity
+          title { romaji english native }
+          synonyms
+        }
+      }
+    }
+"""
 # Fetches a single Media's immediate relations by AniList id. Used to walk a franchise's
 # prequel/sequel chain one hop at a time when the nested GRAPHQL_QUERY runs out of depth.
 GRAPHQL_NODE_QUERY = """
