@@ -254,5 +254,25 @@ class ApiTests(unittest.TestCase):
                                         headers={'Origin': 'https://example.com'})
         self.assertNotIn('Access-Control-Allow-Origin', response.headers)
 
+    def test_extension_origins_may_call_the_api(self):
+        # Firefox users can withhold the host permission, making the background fetch CORS-bound.
+        for origin in ['moz-extension://2d5b1806-249f-4b54-937c-9dd8f218c52f',
+                       'chrome-extension://abcdefghijklmnopabcdefghijklmnop']:
+            with self.subTest(origin=origin):
+                preflight = self.client.options('/discussion', headers={
+                    'Origin': origin, 'Access-Control-Request-Method': 'POST',
+                    'Access-Control-Request-Headers': 'content-type'})
+                self.assertEqual(preflight.headers.get('Access-Control-Allow-Origin'), origin)
+                self.assertIn('Content-Type', preflight.headers.get('Access-Control-Allow-Headers', ''))
+                with patch.object(api, 'get_discussion', return_value={'message': {}}):
+                    response = self.client.post('/discussion', headers={'Origin': origin},
+                                                json={'anime': 'Yu-Gi-Oh!', 'season': 1, 'episode': 1})
+                self.assertEqual(response.headers.get('Access-Control-Allow-Origin'), origin)
+        for origin in ['https://moz-extension.example.com', 'moz-extension://not-a-uuid']:
+            with self.subTest(origin=origin):
+                preflight = self.client.options('/discussion', headers={
+                    'Origin': origin, 'Access-Control-Request-Method': 'POST'})
+                self.assertNotIn('Access-Control-Allow-Origin', preflight.headers)
+
 if __name__ == '__main__':
     unittest.main()

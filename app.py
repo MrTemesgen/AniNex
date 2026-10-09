@@ -8,9 +8,25 @@ import requests
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 4096
-# No CORS: the extension calls this API from its background script, which host
-# permissions exempt from CORS. Allowing every origin only let arbitrary websites use
-# this service (and its MAL/AniList quota) as a proxy.
+# CORS only for browser extensions. Chrome grants the extension's host permission at
+# install, which exempts its background fetch from CORS, but Firefox lets users withhold
+# or revoke it, and then the fetch is a CORS request from moz-extension://<random uuid>.
+# Websites stay blocked so they can't proxy through this service's MAL/AniList quota.
+EXTENSION_ORIGIN = re.compile(r'(?:moz-extension://[0-9a-fA-F-]{36}|chrome-extension://[a-p]{32})')
+
+
+@app.after_request
+def allow_extension_origins(response):
+    origin = request.headers.get('Origin', '')
+    if EXTENSION_ORIGIN.fullmatch(origin):
+        response.headers['Access-Control-Allow-Origin'] = origin
+        response.headers['Access-Control-Allow-Methods'] = 'POST, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        response.headers['Access-Control-Max-Age'] = '86400'
+    response.vary.add('Origin')
+    return response
+
+
 @app.route('/')
 def home():
     return jsonify(message="Hello from AniNex!")
