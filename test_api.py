@@ -254,6 +254,44 @@ class ApiTests(unittest.TestCase):
                                         headers={'Origin': 'https://example.com'})
         self.assertNotIn('Access-Control-Allow-Origin', response.headers)
 
+    def test_discussion_requests_log_stage_timings_without_content(self):
+        search = Mock(status_code=200)
+        search.json.return_value = {'data': {'Page': {'media': [
+            {'id': 7, 'format': 'TV', 'title': {'romaji': 'Secret Show'}}]}}}
+        tree = Mock(status_code=200)
+        tree.json.return_value = {'data': {'Media': {
+            'id': 7, 'idMal': 70, 'format': 'TV', 'episodes': 12, 'title': {'romaji': 'Secret Show'}}}}
+        topic = Mock(status_code=200)
+        topic.json.return_value = {'data': {'title': 'Secret Show Episode 1', 'posts': [{'id': 1}]}}
+        with patch.object(discussion.requests, 'post', side_effect=[search, tree]), \
+                patch.object(discussion, 'get_discussion_link', return_value='4242'), \
+                patch.object(discussion.requests, 'get', return_value=topic), \
+                self.assertLogs('aninex.timing', level='INFO') as logs:
+            response = self.client.post('/discussion', json={'anime': 'Secret Show', 'season': 1, 'episode': 1})
+        self.assertEqual(response.status_code, 200)
+        [line] = logs.output
+        self.assertIn('discussion_timing status=200 total_ms=', line)
+        for stage in ['anilist_search=', 'anilist_tree=', 'mal_topic_page=']:
+            self.assertRegex(line, stage + r'\d+ms/1\b')
+        self.assertRegex(line, r'other_ms=\d+ pid=\d+$')
+        for secret in ['Secret', '4242', '70', 'myanimelist']:
+            self.assertNotIn(secret, line.split(' pid=')[0])
+
+    def test_failed_discussion_requests_are_still_timed(self):
+        with self.assertLogs('aninex.timing', level='INFO') as logs:
+            with patch.object(api, 'get_discussion', side_effect=requests.Timeout()):
+                self.assertEqual(self.client.post(
+                    '/discussion', json={'anime': 'Example', 'season': 1, 'episode': 1}).status_code, 504)
+            api.app.config['PROPAGATE_EXCEPTIONS'] = False
+            try:
+                with patch.object(api, 'get_discussion', side_effect=RuntimeError()):
+                    self.assertEqual(self.client.post(
+                        '/discussion', json={'anime': 'Example', 'season': 1, 'episode': 1}).status_code, 500)
+            finally:
+                api.app.config['PROPAGATE_EXCEPTIONS'] = None
+        self.assertEqual([line.split('discussion_timing ')[1].split(' ')[0] for line in logs.output],
+                         ['status=504', 'status=500'])
+
     def test_extension_origins_may_call_the_api(self):
         # Firefox users can withhold the host permission, making the background fetch CORS-bound.
         for origin in ['moz-extension://2d5b1806-249f-4b54-937c-9dd8f218c52f',
