@@ -194,6 +194,43 @@ class ApiTests(unittest.TestCase):
                 patch.object(discussion, 'fallback_mal_search', return_value=None):
             self.assertIsNone(discussion.resolve_mal_id_with_split_cour('Demon Slayer: Kimetsu no Yaiba', '6', 2)[0])
 
+    @staticmethod
+    def _black_clover():
+        """AniList's shape: the 170-episode series, then a separate, airing 2nd Season."""
+        series = {'id': 1, 'idMal': 34572, 'format': 'TV', 'episodes': 170,
+                  'title': {'romaji': 'Black Clover', 'english': 'Black Clover'}, 'relations': {'edges': []}}
+        sequel = {'id': 2, 'idMal': 61967, 'format': 'TV', 'episodes': None, 'nextAiringEpisode': {'episode': 6},
+                  'title': {'romaji': 'Black Clover 2nd Season', 'english': 'Black Clover Season 2'},
+                  'relations': {'edges': [{'relationType': 'PREQUEL', 'node': series}]}}
+        series['relations']['edges'].append({'relationType': 'SEQUEL', 'node': sequel})
+        return series, sequel
+
+    def test_crunchyroll_split_seasons_keep_absolute_numbers(self):
+        # Crunchyroll splits the 170-episode series into seasons 1-4 with absolute numbers.
+        series, sequel = self._black_clover()
+        with api.app.app_context(), \
+                patch.object(discussion, 'fetch_season_tree', side_effect=[None, series]), \
+                patch.object(discussion, 'fetch_node_relations', return_value=None):
+            self.assertEqual(discussion.resolve_mal_id_with_split_cour('Black Clover', '3', 131),
+                             (34572, 131, 'Black_Clover'))
+        with api.app.app_context(), \
+                patch.object(discussion, 'fetch_season_tree', return_value=sequel), \
+                patch.object(discussion, 'fetch_node_relations', return_value=None):
+            self.assertEqual(discussion.resolve_mal_id_with_split_cour('Black Clover', '2', 52)[:2], (34572, 52))
+            # Episodes of the airing 2nd Season stay local to it, including one just past
+            # AniList's aired count; neither may land on the original series.
+            self.assertEqual(discussion.resolve_mal_id_with_split_cour('Black Clover', '2', 5)[:2], (61967, 5))
+            with patch.object(discussion, 'fallback_mal_search', return_value=None):
+                self.assertNotEqual(discussion.resolve_mal_id_with_split_cour('Black Clover', '2', 6)[0], 34572)
+
+    def test_small_episode_numbers_of_missing_seasons_are_not_absolute(self):
+        series, _ = self._black_clover()
+        with api.app.app_context(), \
+                patch.object(discussion, 'fetch_season_tree', side_effect=[None, series]), \
+                patch.object(discussion, 'fetch_node_relations', return_value=None), \
+                patch.object(discussion, 'fallback_mal_search', return_value=None):
+            self.assertIsNone(discussion.resolve_mal_id_with_split_cour('Black Clover', '4', 3)[0])
+
     def test_later_cours_do_not_count_as_new_seasons(self):
         base = self._chain((1, 'TV', 12, 'Dr. STONE'),
                            (2, 'TV', 11, 'Dr. STONE: STONE WARS'),
