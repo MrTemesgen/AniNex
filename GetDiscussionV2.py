@@ -10,6 +10,7 @@ from time import monotonic
 import constants
 from urllib.parse import urljoin
 from scrape_cache import scrape_result_cache
+from request_timing import timed
 
 CLIENT_ID = os.getenv('CLIENT_ID')
 
@@ -74,11 +75,12 @@ def _is_anilist_not_found(res, payload, root):
             and (data is None or data == {root: None}))
 
 
-def _anilist_media(query, variables):
+def _anilist_media(query, variables, stage):
     """Run an AniList query whose result is `data.Media`. Returns None only for AniList's
     explicit not-found shape; rate limits and other errors raise so a partial franchise
     walk can never silently produce the wrong episode."""
-    res = requests.post(constants.ANILIST_API_URL, json={'query': query, 'variables': variables}, timeout=10)
+    with timed(stage):
+        res = requests.post(constants.ANILIST_API_URL, json={'query': query, 'variables': variables}, timeout=10)
     # AniList returns {"data": null, "errors": [...]} on error, so guard against None.
     payload = res.json()
     if _is_anilist_not_found(res, payload, 'Media'):
@@ -96,8 +98,9 @@ def _anilist_media(query, variables):
 
 
 def _search_candidates(search_term):
-    res = requests.post(constants.ANILIST_API_URL, json={
-        'query': constants.GRAPHQL_SEARCH_QUERY, 'variables': {'search': search_term}}, timeout=10)
+    with timed('anilist_search'):
+        res = requests.post(constants.ANILIST_API_URL, json={
+            'query': constants.GRAPHQL_SEARCH_QUERY, 'variables': {'search': search_term}}, timeout=10)
     payload = res.json()
     if _is_anilist_not_found(res, payload, 'Page') or _is_anilist_not_found(res, payload, 'Media'):
         return []
@@ -147,7 +150,7 @@ def fetch_media_tree(anilist_id):
     """The nested season tree for one AniList entry."""
     hit, node = _TREE_CACHE.get(anilist_id)
     if not hit:
-        node = _anilist_media(constants.GRAPHQL_QUERY, {'id': anilist_id})
+        node = _anilist_media(constants.GRAPHQL_QUERY, {'id': anilist_id}, 'anilist_tree')
         _TREE_CACHE.set(anilist_id, node)
     return node
 
@@ -171,7 +174,7 @@ def fetch_node_relations(anilist_id):
         return None
     hit, node = _NODE_CACHE.get(anilist_id)
     if not hit:
-        node = _anilist_media(constants.GRAPHQL_NODE_QUERY, {'id': anilist_id})
+        node = _anilist_media(constants.GRAPHQL_NODE_QUERY, {'id': anilist_id}, 'anilist_relations')
         _NODE_CACHE.set(anilist_id, node)
     return node
 
@@ -310,7 +313,8 @@ def fallback_mal_search(anime_query, season):
     try:
         url = constants.MAL_ANIME_URL
         params = {'q': search_term, 'limit': 1}
-        response = requests.get(url, params=params, headers={'X-MAL-CLIENT-ID': CLIENT_ID}, timeout=10)
+        with timed('mal_anime_search'):
+            response = requests.get(url, params=params, headers={'X-MAL-CLIENT-ID': CLIENT_ID}, timeout=10)
         
         if response.status_code == 200:
             data = response.json().get('data', [])
@@ -421,6 +425,12 @@ def resolve_mal_id_with_split_cour(anime_query, season, episode):
 # 3. SCRAPERS & FORUM SEARCH
 # ---------------------------------------------------------
 
+def _timed_get(stage, url):
+    # Only runs on a scrape-cache miss, so cache hits add no stage time.
+    with timed(stage):
+        return requests.get(url, timeout=10)
+
+
 def parse_episode_links(content, offset):
     """Retain only episode-to-topic IDs, never the upstream page."""
     soup = BeautifulSoup(content, 'html.parser')
@@ -452,7 +462,7 @@ def get_discussion_link(anime, id, episode):
         
         links = scrape_result_cache.get(
             ('episodes', int(id), offset), 600,
-            lambda: requests.get(BASE_URL, timeout=10),
+            lambda: _timed_get('mal_episode_page', BASE_URL),
             lambda body: parse_episode_links(body, offset))
         return links.get(str(episode))
         
@@ -466,7 +476,8 @@ def fallback_forum_search(clean_title, local_ep):
     try:
         url = constants.MAL_FORUM_URL
         params = {'q': query, 'limit': 5}
-        response = requests.get(url, params=params, headers={'X-MAL-CLIENT-ID': CLIENT_ID}, timeout=10)
+        with timed('mal_forum_search'):
+            response = requests.get(url, params=params, headers={'X-MAL-CLIENT-ID': CLIENT_ID}, timeout=10)
         
         if response.status_code == 200:
             topics = response.json().get('data', [])
@@ -587,7 +598,7 @@ def scrape_forum_topic_html(discussion_id):
         topic_url = f"https://myanimelist.net/forum/?topicid={topic_id}"
         return scrape_result_cache.get(
             ('topic', topic_id), 60,
-            lambda: requests.get(topic_url, timeout=10),
+            lambda: _timed_get('mal_topic_scrape', topic_url),
             lambda body: parse_forum_topic(body, topic_id))
     except Exception:
         current_app.logger.warning("Discussion provider request failed.")
@@ -657,8 +668,9 @@ def fetch_mal_topic(discussion_id):
         if page and monotonic() > deadline:
             break
         try:
-            response = requests.get(url, params={'limit': MAL_TOPIC_PAGE_SIZE, 'offset': page * MAL_TOPIC_PAGE_SIZE},
-                                    headers={'X-MAL-CLIENT-ID': CLIENT_ID}, timeout=10)
+            with timed('mal_topic_page'):
+                response = requests.get(url, params={'limit': MAL_TOPIC_PAGE_SIZE, 'offset': page * MAL_TOPIC_PAGE_SIZE},
+                                        headers={'X-MAL-CLIENT-ID': CLIENT_ID}, timeout=10)
             mal_data = response.json()
             if not isinstance(mal_data, dict):
                 raise ValueError('Invalid MAL response')

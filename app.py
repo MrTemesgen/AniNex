@@ -5,6 +5,7 @@ import json
 import os
 import re
 import requests
+import request_timing
 
 app = Flask(__name__)
 app.config['MAX_CONTENT_LENGTH'] = 4096
@@ -25,6 +26,30 @@ def allow_extension_origins(response):
         response.headers['Access-Control-Max-Age'] = '86400'
     response.vary.add('Origin')
     return response
+
+
+def _is_discussion_request():
+    return request.method == 'POST' and request.path == '/discussion'
+
+
+@app.before_request
+def start_discussion_timing():
+    if _is_discussion_request():
+        request_timing.start()
+
+
+@app.after_request
+def log_discussion_timing(response):
+    if _is_discussion_request():
+        request_timing.finish(response.status_code)
+    return response
+
+
+@app.teardown_request
+def log_failed_discussion_timing(error):
+    # after_request is skipped when an unhandled exception becomes a 500.
+    if error is not None and _is_discussion_request():
+        request_timing.finish(500)
 
 
 @app.route('/')
