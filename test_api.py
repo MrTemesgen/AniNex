@@ -223,6 +223,50 @@ class ApiTests(unittest.TestCase):
             with patch.object(discussion, 'fallback_mal_search', return_value=None):
                 self.assertNotEqual(discussion.resolve_mal_id_with_split_cour('Black Clover', '2', 6)[0], 34572)
 
+    def test_loose_season_match_from_another_show_yields_to_the_split_series(self):
+        # Crunchyroll's "Yu-Gi-Oh!" is the 224-episode Duel Monsters in five seasons with
+        # absolute numbers; AniList's search for "Yu-Gi-Oh! Season 2" finds ZEXAL II.
+        duel_monsters = self._chain((1, 'TV', 224, 'Yu☆Gi☆Oh! Duel Monsters'),
+                                    (2, 'TV', 180, 'Yu☆Gi☆Oh! Duel Monsters GX'))
+        duel_monsters['idMal'] = 481
+        duel_monsters['title']['english'] = 'Yu-Gi-Oh!'
+        zexal_ii = {'id': 3, 'idMal': 15489, 'format': 'TV', 'episodes': 73,
+                    'title': {'romaji': 'Yu☆Gi☆Oh! ZEXAL II', 'english': 'Yu-Gi-Oh! ZEXAL II'}}
+        with api.app.app_context(), \
+                patch.object(discussion, 'fetch_season_tree',
+                             side_effect=lambda term: zexal_ii if 'Season' in term else duel_monsters), \
+                patch.object(discussion, 'fetch_node_relations', return_value=None):
+            self.assertEqual(discussion.resolve_mal_id_with_split_cour('Yu-Gi-Oh!', '2', 50)[:2], (481, 50))
+            self.assertEqual(discussion.resolve_mal_id_with_split_cour('Yu-Gi-Oh!', '5', 210)[:2], (481, 210))
+
+    def test_loose_season_match_is_kept_for_short_base_or_local_numbers(self):
+        # Dr. STONE S4 is "SCIENCE FUTURE" (not an exact title) and numbers locally.
+        base = self._chain((1, 'TV', 24, 'Dr. STONE'), (2, 'TV', 12, 'Dr. STONE: SCIENCE FUTURE'))
+        science_future = base['relations']['edges'][0]['node']
+        science_future['title']['english'] = 'Dr. STONE SCIENCE FUTURE'
+        with api.app.app_context(), \
+                patch.object(discussion, 'fetch_season_tree',
+                             side_effect=lambda term: science_future if 'Season' in term else base), \
+                patch.object(discussion, 'fetch_node_relations', return_value=None):
+            self.assertEqual(discussion.resolve_mal_id_with_split_cour('Dr. STONE', '4', 1)[:2], (20, 1))
+            # A short base isn't a split series, even for a number it covers.
+            self.assertEqual(discussion.resolve_mal_id_with_split_cour('Dr. STONE', '2', 12)[:2], (20, 12))
+
+    def test_mal_search_only_accepts_entries_named_after_the_show(self):
+        response = Mock(status_code=200)
+        response.json.return_value = {'data': [
+            {'node': {'id': 28977, 'title': 'Gintama°', 'alternative_titles': {'en': 'Gintama Season 4'}}},
+            {'node': {'id': 40028, 'title': 'Shingeki no Kyojin: The Final Season'}}]}
+        with api.app.app_context(), patch.object(discussion.requests, 'get', return_value=response) as get:
+            self.assertIsNone(discussion.fallback_mal_search('Yu-Gi-Oh!', '3'))
+        self.assertEqual(get.call_args.kwargs['params']['q'], 'Yu-Gi-Oh! Season 3')
+        response.json.return_value = {'data': [
+            {'node': {'id': 1, 'title': 'Black Cloverfield'}},
+            {'node': {'id': 61967, 'title': 'Black Clover 2nd Season',
+                      'alternative_titles': {'en': 'Black Clover Season 2'}}}]}
+        with api.app.app_context(), patch.object(discussion.requests, 'get', return_value=response):
+            self.assertEqual(discussion.fallback_mal_search('Black Clover', '2'), 61967)
+
     def test_small_episode_numbers_of_missing_seasons_are_not_absolute(self):
         series, _ = self._black_clover()
         with api.app.app_context(), \
