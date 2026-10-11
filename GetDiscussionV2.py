@@ -296,6 +296,36 @@ def find_nth_tv_season(base_node, season_number):
             return nxt
     return None
 
+# A cour is at least ~10 episodes, so seasons 1..N-1 hold at least 10 * (N - 1).
+MIN_EPISODES_PER_SEASON = 10
+# An airing season's next episode may be listed before AniList's count updates.
+AIRING_EPISODE_MARGIN = 13
+
+
+def _clearly_absolute(target_ep, season_number):
+    """True when an episode number is too large to be local to season N's start."""
+    return target_ep > MIN_EPISODES_PER_SEASON * (season_number - 1)
+
+
+def _local_episode_limit(season_node, season_span):
+    """Largest episode number that could still be local to this season. A finished
+    season ends at its span; an airing one may run ahead of AniList's aired count."""
+    return season_span if season_node.get('episodes') else season_span + AIRING_EPISODE_MARGIN
+
+
+def _franchise_root(node):
+    """First entry of a franchise's PREQUEL chain."""
+    visited = {node.get('id') or node.get('idMal')}
+    for _ in range(20):  # bound against cycles / runaway chains
+        prev = _step(node, constants.RELATION_TYPE_PREQUEL)
+        key = prev and (prev.get('id') or prev.get('idMal'))
+        if not prev or key in visited:
+            break
+        visited.add(key)
+        node = prev
+    return node
+
+
 # ---------------------------------------------------------
 # 2. RESOLVERS & FALLBACKS
 # ---------------------------------------------------------
@@ -347,13 +377,16 @@ def resolve_mal_id_with_split_cour(anime_query, season, episode):
             nth = find_nth_tv_season(base_node, int(season_str))
             if nth:
                 current_node = (fetch_media_tree(nth['id']) if nth.get('id') else None) or nth
-            # Streaming services can divide one catalog entry into several seasons.
-            # Preserve the absolute episode only for a single-season franchise whose
-            # TV entry's episode count covers the number. A franchise with real later
-            # seasons must not fall back to its first season's episodes.
+            # Streaming services can divide one catalog entry into several seasons
+            # and keep its absolute numbering (Crunchyroll's Black Clover S3 E131 is
+            # episode 131 of the 170-episode series). Accept that reading when the base
+            # covers the number and either the franchise has no other TV season or the
+            # number is too large to be local to season N; a small local number of a
+            # later season must not land on the first season's episodes.
             elif (base_node.get('format') == 'TV'
                     and 0 < target_ep <= _tv_episode_count(base_node)
-                    and not find_nth_tv_season(base_node, 2)):
+                    and (not find_nth_tv_season(base_node, 2)
+                         or _clearly_absolute(target_ep, int(season_str)))):
                 return base_node.get('idMal'), target_ep, (
                     base_node['title'].get('romaji') or anime_query).replace(' ', '_')
 
@@ -373,6 +406,11 @@ def resolve_mal_id_with_split_cour(anime_query, season, episode):
             # Only subtract a sane offset; otherwise leave the number untouched and treat as local.
             if 0 < offset < target_ep:
                 target_ep -= offset
+            elif offset >= target_ep and target_ep > _local_episode_limit(current_node, season_span):
+                # The number lies inside earlier entries, so it counts from the franchise
+                # start: Crunchyroll's Black Clover S2 E52 is episode 52 of the original
+                # series, not of AniList's separate, newer "2nd Season".
+                current_node = _franchise_root(current_node)
         else:
             current_app.logger.debug("Resolving episode discussion.")
 
