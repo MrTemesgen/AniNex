@@ -302,6 +302,15 @@ MIN_EPISODES_PER_SEASON = 10
 AIRING_EPISODE_MARGIN = 13
 
 
+# Entries this long are the ones streaming services split into several seasons.
+LONG_RUNNING_EPISODES = 50
+
+
+def _base_result(base_node, anime_query, target_ep):
+    return base_node.get('idMal'), target_ep, (
+        base_node['title'].get('romaji') or anime_query).replace(' ', '_')
+
+
 def _clearly_absolute(target_ep, season_number):
     """True when an episode number is too large to be local to season N's start."""
     return target_ep > MIN_EPISODES_PER_SEASON * (season_number - 1)
@@ -342,18 +351,30 @@ def fallback_mal_search(anime_query, season):
         
     try:
         url = constants.MAL_ANIME_URL
-        params = {'q': search_term, 'limit': 1}
+        params = {'q': search_term, 'limit': 5, 'fields': 'alternative_titles'}
         with timed('mal_anime_search'):
             response = requests.get(url, params=params, headers={'X-MAL-CLIENT-ID': CLIENT_ID}, timeout=10)
         
         if response.status_code == 200:
-            data = response.json().get('data', [])
-            if data:
-                return data[0]['node']['id']
+            # MAL's ranking ignores the title for unknown seasons: "Yu-Gi-Oh! Season 3"
+            # ranks Gintama° first. Only accept an entry named after the show.
+            for item in response.json().get('data', []):
+                node = item.get('node') or {}
+                if _mal_titles_contain(node, anime_query):
+                    return node.get('id')
     except Exception as e:
         current_app.logger.warning("Discussion provider request failed.")
         
     return None
+
+
+def _mal_titles_contain(node, anime_query):
+    wanted = _title_key(anime_query)
+    alternative = node.get('alternative_titles') or {}
+    titles = [node.get('title'), alternative.get('en'), alternative.get('ja')]
+    titles += alternative.get('synonyms') or []
+    return bool(wanted) and any(
+        f' {wanted} ' in f' {_title_key(title)} ' for title in titles if isinstance(title, str))
 
 def resolve_mal_id_with_split_cour(anime_query, season, episode):
     target_ep = int(episode)
@@ -387,8 +408,21 @@ def resolve_mal_id_with_split_cour(anime_query, season, episode):
                     and 0 < target_ep <= _tv_episode_count(base_node)
                     and (not find_nth_tv_season(base_node, 2)
                          or _clearly_absolute(target_ep, int(season_str)))):
-                return base_node.get('idMal'), target_ep, (
-                    base_node['title'].get('romaji') or anime_query).replace(' ', '_')
+                return _base_result(base_node, anime_query, target_ep)
+    elif (current_node and season_str.isdigit() and int(season_str) > 1
+            and not _title_matches(search_term, current_node)):
+        # A loose match for "<title> Season N" can be a different show in the same
+        # AniList franchise: "Yu-Gi-Oh! Season 2" finds ZEXAL II, though Crunchyroll's
+        # "Yu-Gi-Oh!" is only the 224-episode Duel Monsters, split into five seasons
+        # with absolute numbers. Prefer that long base entry when it covers the number
+        # and the number is too large to be local to season N.
+        base_node = fetch_season_tree(anime_query)
+        if (base_node and _title_matches(anime_query, base_node)
+                and base_node.get('format') == 'TV'
+                and _tv_episode_count(base_node) >= LONG_RUNNING_EPISODES
+                and 0 < target_ep <= _tv_episode_count(base_node)
+                and _clearly_absolute(target_ep, int(season_str))):
+            return _base_result(base_node, anime_query, target_ep)
 
     if not current_node:
         return fallback_mal_search(anime_query, season), target_ep, search_term.replace(' ', '_')
