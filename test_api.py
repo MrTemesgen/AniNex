@@ -252,6 +252,28 @@ class ApiTests(unittest.TestCase):
             # A short base isn't a split series, even for a number it covers.
             self.assertEqual(discussion.resolve_mal_id_with_split_cour('Dr. STONE', '2', 12)[:2], (20, 12))
 
+    def test_ova_seasons_resolve_to_the_related_ova_entry(self):
+        # Crunchyroll's Slime "OVA Season 1" (E1-E5) is AniList's 2019 five-episode OVA.
+        def entry(anilist_id, mal_id, fmt, episodes, year, romaji):
+            return {'id': anilist_id, 'idMal': mal_id, 'format': fmt, 'episodes': episodes,
+                    'startDate': {'year': year, 'month': 1}, 'title': {'romaji': romaji}}
+        base = entry(101280, 37430, 'TV', 24, 2018, 'Tensei Shitara Slime Datta Ken')
+        base['title']['english'] = 'That Time I Got Reincarnated as a Slime'
+        base['relations'] = {'edges': [
+            {'relationType': 'SEQUEL', 'node': entry(161802, 54565, 'OVA', 3, 2023, 'Coleus no Yume')},
+            {'relationType': 'ADAPTATION', 'node': entry(86399, 87609, 'MANGA', None, 2015, 'Manga')},
+            {'relationType': 'SIDE_STORY', 'node': entry(106509, 38793, 'OVA', 5, 2019, 'Slime OVA')},
+            {'relationType': 'SPIN_OFF', 'node': entry(116741, 41488, 'TV', 12, 2021, 'Tensura Nikki')}]}
+        with api.app.app_context(), patch.object(discussion, 'fetch_season_tree', return_value=base) as fetch:
+            self.assertEqual(discussion.resolve_mal_id_with_split_cour(
+                'That Time I Got Reincarnated as a Slime', 'ova', 4)[:2], (38793, 4))
+            self.assertEqual(discussion.resolve_mal_id_with_split_cour(
+                'That Time I Got Reincarnated as a Slime', 'ova', 1)[:2], (38793, 1))
+            # No related OVA has an episode 6: report no match, never season 1's episode.
+            self.assertIsNone(discussion.resolve_mal_id_with_split_cour(
+                'That Time I Got Reincarnated as a Slime', 'ova', 6)[0])
+        fetch.assert_called_with('That Time I Got Reincarnated as a Slime')
+
     def test_mal_search_only_accepts_entries_named_after_the_show(self):
         response = Mock(status_code=200)
         response.json.return_value = {'data': [

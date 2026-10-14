@@ -10,6 +10,7 @@ GRAPHQL_QUERY = """
       format
       title { romaji english }
       nextAiringEpisode { episode }
+      startDate { year month day }
     }
 
     query ($id: Int) {
