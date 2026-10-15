@@ -306,6 +306,46 @@ AIRING_EPISODE_MARGIN = 13
 LONG_RUNNING_EPISODES = 50
 
 
+# Formats accepted for each non-TV season kind, in order of preference. AniList and
+# MAL disagree on whether an OAD is an OVA or a special, so each accepts both.
+SIDE_SEASON_FORMATS = {
+    'ova': (constants.FORMAT_OVA, constants.FORMAT_SPECIAL),
+    'special': (constants.FORMAT_SPECIAL, constants.FORMAT_OVA),
+    'movie': (constants.FORMAT_MOVIE,),
+}
+
+
+def find_side_entry(base_node, kind, target_ep):
+    """The franchise's first-released OVA/special/movie entry (in the base's relation
+    tree) that has the requested episode. Earliest release matches Crunchyroll's
+    "OVA Season 1"; requiring the episode skips shorter later entries."""
+    formats = SIDE_SEASON_FORMATS[kind]
+    candidates, seen = [], {base_node.get('id') or base_node.get('idMal')}
+
+    def collect(node, depth):
+        for edge in (node.get('relations') or {}).get('edges', []):
+            related = edge.get('node') or {}
+            key = related.get('id') or related.get('idMal')
+            if key in seen:
+                continue
+            seen.add(key)
+            if related.get('format') in formats and related.get('idMal'):
+                episodes = related.get('episodes')
+                if not episodes or target_ep <= episodes:
+                    candidates.append(related)
+            if depth < 3:
+                collect(related, depth + 1)
+
+    collect(base_node, 0)
+
+    def release(node):
+        start = node.get('startDate') or {}
+        return (start.get('year') or 9999, start.get('month') or 12, start.get('day') or 31)
+
+    candidates.sort(key=lambda node: (formats.index(node['format']), release(node), node.get('id') or 0))
+    return candidates[0] if candidates else None
+
+
 def _base_result(base_node, anime_query, target_ep):
     return base_node.get('idMal'), target_ep, (
         base_node['title'].get('romaji') or anime_query).replace(' ', '_')
@@ -388,6 +428,17 @@ def resolve_mal_id_with_split_cour(anime_query, season, episode):
         
     current_app.logger.debug("Resolving episode discussion.")
     
+    if season_str.lower() in SIDE_SEASON_FORMATS:
+        # Crunchyroll files OVAs/specials as extra seasons of the main show ("OVA Season 1"
+        # is season 5 of Slime). They are separate AniList entries related to the series.
+        base_node = fetch_season_tree(anime_query)
+        side = (find_side_entry(base_node, season_str.lower(), target_ep)
+                if base_node and _title_matches(anime_query, base_node) else None)
+        if side:
+            return side.get('idMal'), target_ep, (
+                side['title'].get('romaji') or anime_query).replace(' ', '_')
+        return None, target_ep, search_term.replace(' ', '_')
+
     # 2. Fetch the starting node for this specific season
     current_node = fetch_season_tree(search_term)
     if not current_node and season_str.isdigit() and int(season_str) > 1:
