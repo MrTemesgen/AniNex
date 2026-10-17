@@ -775,6 +775,61 @@ def _mal_error_code(mal_data):
     return str(error_code or 'error')
 
 
+def _get_topic_page(url, offset, limit):
+    with timed('mal_topic_page'):
+        response = requests.get(url, params={'limit': limit, 'offset': offset},
+                                headers={'X-MAL-CLIENT-ID': CLIENT_ID}, timeout=10)
+    mal_data = response.json()
+    if not isinstance(mal_data, dict):
+        raise ValueError('Invalid MAL response')
+    return response, mal_data
+
+
+def _is_unreadable_page(response, mal_data):
+    # MAL rejects a whole page with 400 {"errors": [{"message": "invalid request"}]} when one
+    # post in it can't be served (Haikyuu!! episode 11, post #19); its neighbours load fine.
+    errors = mal_data.get('errors')
+    return (response.status_code == 400 and isinstance(errors, list)
+            and any(isinstance(error, dict) and error.get('message') == 'invalid request' for error in errors))
+
+
+def _page_data(response, mal_data):
+    response.raise_for_status()
+    data = mal_data.get('data')
+    if not isinstance(data, dict):
+        raise ValueError('Missing MAL discussion data')
+    page_posts = data.get('posts') or []
+    if not isinstance(page_posts, list):
+        raise ValueError('Invalid MAL posts')
+    return data, page_posts
+
+
+def _fetch_around_unreadable(url, offset, limit, deadline):
+    """Split a page MAL rejected until only its unreadable posts are left out. Returns
+    (topic data or None, posts, positions covered incl. skipped posts, complete)."""
+    if limit == 1:
+        return None, [], 1, True  # the unreadable post itself
+    if monotonic() > deadline:
+        return None, [], 0, False
+    data, posts, covered = None, [], 0
+    half = limit // 2
+    for start, size in ((offset, half), (offset + half, limit - half)):
+        response, mal_data = _get_topic_page(url, start, size)
+        if _is_unreadable_page(response, mal_data):
+            part_data, part_posts, part_covered, complete = _fetch_around_unreadable(url, start, size, deadline)
+            if not complete:
+                return data or part_data, posts + part_posts, covered + part_covered, False
+        else:
+            part_data, part_posts = _page_data(response, mal_data)
+            part_covered = len(part_posts)
+        data = data or part_data
+        posts += part_posts
+        covered += part_covered
+        if part_covered < size:  # the thread ends inside this range
+            break
+    return data, posts, covered, True
+
+
 def fetch_mal_topic(discussion_id):
     """Every post of a MAL topic, paging past MAL's 100-post limit so popular episodes
     show their recent replies, not just the first 100. Returns (error_code, topic)."""
@@ -790,25 +845,23 @@ def fetch_mal_topic(discussion_id):
     for page in range(MAL_TOPIC_MAX_PAGES):
         if page and monotonic() > deadline:
             break
+        offset = page * MAL_TOPIC_PAGE_SIZE
         try:
-            with timed('mal_topic_page'):
-                response = requests.get(url, params={'limit': MAL_TOPIC_PAGE_SIZE, 'offset': page * MAL_TOPIC_PAGE_SIZE},
-                                        headers={'X-MAL-CLIENT-ID': CLIENT_ID}, timeout=10)
-            mal_data = response.json()
-            if not isinstance(mal_data, dict):
-                raise ValueError('Invalid MAL response')
+            response, mal_data = _get_topic_page(url, offset, MAL_TOPIC_PAGE_SIZE)
             if 'error' in mal_data:
                 current_app.logger.warning("Discussion provider request failed.")
                 if page == 0:
                     return _mal_error_code(mal_data), None
                 break
-            response.raise_for_status()
-            data = mal_data.get('data')
-            if not isinstance(data, dict):
-                raise ValueError('Missing MAL discussion data')
-            page_posts = data.get('posts') or []
-            if not isinstance(page_posts, list):
-                raise ValueError('Invalid MAL posts')
+            if _is_unreadable_page(response, mal_data):
+                data, page_posts, covered, complete = _fetch_around_unreadable(
+                    url, offset, MAL_TOPIC_PAGE_SIZE, deadline)
+                paging = None
+            else:
+                data, page_posts = _page_data(response, mal_data)
+                covered, complete, paging = len(page_posts), True, mal_data.get('paging')
+            if topic is None and data is None:
+                raise ValueError('No readable MAL posts')
         except (requests.RequestException, ValueError):
             # The first page decides success; a later page failing keeps what we have.
             if page == 0:
@@ -824,8 +877,9 @@ def fetch_mal_topic(discussion_id):
                 continue
             seen.add(key)
             posts.append(post)
-        paging = mal_data.get('paging')
-        if len(page_posts) < MAL_TOPIC_PAGE_SIZE or (isinstance(paging, dict) and not paging.get('next')):
+        if not complete:
+            break
+        if covered < MAL_TOPIC_PAGE_SIZE or (isinstance(paging, dict) and not paging.get('next')):
             truncated = False
             break
 

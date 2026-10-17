@@ -332,6 +332,45 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(len(topic['posts']), 100)
         self.assertTrue(topic['truncated'])
 
+    @staticmethod
+    def _mal_thread_with_unreadable(total, unreadable):
+        """Fake MAL topic API: any page containing an unreadable post is a 400 'invalid request'."""
+        def get(url, params, headers, timeout):
+            offset, limit = params['offset'], params['limit']
+            positions = range(offset, min(offset + limit, total))
+            page = Mock()
+            if any(index in unreadable for index in positions):
+                page.status_code = 400
+                page.json.return_value = {'errors': [{'message': 'invalid request'}]}
+                page.raise_for_status.side_effect = requests.HTTPError()
+            else:
+                page.status_code = 200
+                page.json.return_value = {'data': {'title': 'Haikyuu!! Episode 11 Discussion',
+                                                   'posts': [{'id': index} for index in positions]}}
+            return page
+        return get
+
+    def test_unreadable_mal_posts_are_skipped_not_fatal(self):
+        # Haikyuu!! episode 11: MAL can't serve post #19, so every page containing it fails.
+        with api.app.app_context(), patch.object(
+                discussion.requests, 'get', side_effect=self._mal_thread_with_unreadable(130, {18})) as get:
+            error, topic = discussion.fetch_mal_topic('1200997')
+        self.assertIsNone(error)
+        self.assertEqual([post['id'] for post in topic['posts']], [n for n in range(130) if n != 18])
+        self.assertEqual(topic['title'], 'Haikyuu!! Episode 11 Discussion')
+        self.assertNotIn('truncated', topic)
+        self.assertLess(get.call_count, 25)
+
+    def test_threads_ending_inside_a_split_page_and_first_post_unreadable(self):
+        for total, unreadable in [(25, {18}), (12, {0}), (40, {3, 31})]:
+            with self.subTest(total=total, unreadable=unreadable), api.app.app_context(), patch.object(
+                    discussion.requests, 'get', side_effect=self._mal_thread_with_unreadable(total, unreadable)):
+                discussion.clear_caches()
+                error, topic = discussion.fetch_mal_topic('7')
+            self.assertEqual([post['id'] for post in topic['posts']],
+                             [n for n in range(total) if n not in unreadable])
+            self.assertNotIn('truncated', topic)
+
     def test_missing_mal_topic_is_not_reported_as_an_outage(self):
         missing = Mock(status_code=404)
         missing.json.return_value = {'error': 'not_found', 'message': ''}
