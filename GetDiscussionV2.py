@@ -59,7 +59,7 @@ _TOPIC_CACHE = _TTLCache(ttl=60, max_entries=128)     # MAL topic id -> assemble
 
 
 def clear_caches():
-    for cache in (_SEARCH_CACHE, _TREE_CACHE, _NODE_CACHE, _TOPIC_CACHE):
+    for cache in (_SEARCH_CACHE, _TREE_CACHE, _NODE_CACHE, _TOPIC_CACHE, _PICKER_CACHE):
         cache.clear()
 
 
@@ -336,6 +336,11 @@ def find_side_entry(base_node, kind, target_ep):
             if depth < 3:
                 collect(related, depth + 1)
 
+    # The matched entry can itself be the OVA (Shinmai Maou no Testament: DEPARTURES).
+    base_episodes = base_node.get('episodes')
+    if (base_node.get('format') in formats and base_node.get('idMal')
+            and (not base_episodes or target_ep <= base_episodes)):
+        candidates.append(base_node)
     collect(base_node, 0)
 
     def release(node):
@@ -732,9 +737,62 @@ def scrape_forum_topic_html(discussion_id):
 # 4. MAIN ENDPOINT
 # ---------------------------------------------------------
 
-def get_discussion(anime_query, season, episode):
-    # Use our hybrid split-cour resolver
-    mal_id, local_ep, anime_slug = resolve_mal_id_with_split_cour(anime_query, season, episode)
+_PICKER_CACHE = _TTLCache(ttl=3600, max_entries=512)  # normalized query -> picker results
+
+
+def _picker_cover(media):
+    cover = media.get('coverImage') or {}
+    for url in (cover.get('large'), cover.get('medium')):
+        if isinstance(url, str) and url.startswith('https://'):
+            return url
+    return None
+
+
+def search_shows(query):
+    """Picker results for a user's search: entries with a MAL id, with titles in every
+    script AniList has (English, romaji, native) and cover art."""
+    key = _title_key(query)
+    hit, results = _PICKER_CACHE.get(key)
+    if hit:
+        return results
+    with timed('anilist_picker_search'):
+        res = requests.post(constants.ANILIST_API_URL, json={
+            'query': constants.GRAPHQL_PICKER_QUERY, 'variables': {'search': query}}, timeout=10)
+    payload = res.json()
+    if _is_anilist_not_found(res, payload, 'Page'):
+        media = []
+    else:
+        res.raise_for_status()
+        page = ((payload.get('data') or {}).get('Page') or {}) if isinstance(payload, dict) else {}
+        media = page.get('media')
+        if not isinstance(media, list):
+            raise ValueError('Invalid AniList search results')
+    results = []
+    for item in media:
+        if not isinstance(item, dict) or not isinstance(item.get('idMal'), int) or isinstance(item.get('idMal'), bool):
+            continue
+        titles = item.get('title') or {}
+        results.append({
+            'mal_id': item['idMal'],
+            'title': titles.get('english') or titles.get('romaji') or titles.get('native'),
+            'romaji': titles.get('romaji'),
+            'native': titles.get('native'),
+            'format': item.get('format'),
+            'episodes': item.get('episodes'),
+            'year': item.get('seasonYear') or (item.get('startDate') or {}).get('year'),
+            'cover': _picker_cover(item),
+        })
+    _PICKER_CACHE.set(key, results)
+    return results
+
+
+def get_discussion(anime_query, season, episode, mal_id=None):
+    if mal_id:
+        # The user picked this exact entry; its episode numbering is the displayed one.
+        mal_id, local_ep, anime_slug = mal_id, episode, anime_query.replace(' ', '_')
+    else:
+        # Use our hybrid split-cour resolver
+        mal_id, local_ep, anime_slug = resolve_mal_id_with_split_cour(anime_query, season, episode)
 
     if not mal_id:
         return jsonify(message=constants.MESSAGE_MAL_ID_NOT_FOUND)
