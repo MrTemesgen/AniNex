@@ -1,5 +1,5 @@
 from flask import Flask, Response, jsonify, current_app
-from GetDiscussionV2 import get_discussion
+from GetDiscussionV2 import get_discussion, search_shows
 from flask import request
 import json
 import os
@@ -63,19 +63,40 @@ def getDiscussionPayload():
     anime = data.get('anime')
     season = data.get('season')
     episode = data.get('episode')
+    mal_id = data.get('mal_id')
     if (not isinstance(anime, str) or not anime.strip() or len(anime) > 300
             or isinstance(season, bool) or not isinstance(season, (str, int))
             or not re.fullmatch(r'(?:\d{1,3}|movie|ova|special)', str(season).lower())
             or isinstance(episode, bool) or not isinstance(episode, (str, int))
-            or not re.fullmatch(r'[1-9]\d{0,4}', str(episode))):
+            or not re.fullmatch(r'[1-9]\d{0,4}', str(episode))
+            or (mal_id is not None and (isinstance(mal_id, bool) or not isinstance(mal_id, (str, int))
+                                        or not re.fullmatch(r'[1-9]\d{0,7}', str(mal_id))))):
         return jsonify(error='invalid_request', message='Provide an anime, valid season, and positive episode number.'), 400
     try:
-        return get_discussion(anime_query=anime.strip(), season=str(season).lower(), episode=int(episode))
+        return get_discussion(anime_query=anime.strip(), season=str(season).lower(), episode=int(episode),
+                              mal_id=int(mal_id) if mal_id is not None else None)
     except requests.Timeout:
         return jsonify(error='upstream_timeout', message='Discussion service timed out. Please retry.'), 504
     except (requests.RequestException, ValueError, TypeError, KeyError):
         current_app.logger.warning('Discussion provider returned an unavailable or invalid response.')
         return jsonify(error='upstream_unavailable', message='Discussion service is unavailable. Please retry.'), 502
+
+@app.route('/search', methods=['POST'])
+def searchShows():
+    # Show picker: lets a user choose the anime when Crunchyroll gives no usable title or
+    # the automatic match is wrong. POST keeps search text out of URL access logs.
+    data = request.get_json(silent=True)
+    query = data.get('q') if isinstance(data, dict) else None
+    if not isinstance(query, str) or not 2 <= len(query.strip()) <= 100:
+        return jsonify(error='invalid_request', message='Search for 2 to 100 characters.'), 400
+    try:
+        return jsonify(results=search_shows(query.strip()))
+    except requests.Timeout:
+        return jsonify(error='upstream_timeout', message='Search timed out. Please retry.'), 504
+    except (requests.RequestException, ValueError, TypeError, KeyError):
+        current_app.logger.warning('Show search provider returned an unavailable or invalid response.')
+        return jsonify(error='upstream_unavailable', message='Search is unavailable. Please retry.'), 502
+
 
 DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data.json')
 _data_body = None

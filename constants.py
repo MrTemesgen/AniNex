@@ -68,6 +68,24 @@ GRAPHQL_SEARCH_QUERY = """
       }
     }
 """
+# Show picker: entries a user can choose when Crunchyroll gives no usable title or the
+# automatic match is wrong. Cover art lets people recognize a show they can't name.
+GRAPHQL_PICKER_QUERY = """
+    query ($search: String) {
+      Page (perPage: 12) {
+        media (search: $search, type: ANIME, isAdult: false, sort: [SEARCH_MATCH, POPULARITY_DESC]) {
+          id
+          idMal
+          format
+          episodes
+          seasonYear
+          startDate { year }
+          title { romaji english native }
+          coverImage { medium large }
+        }
+      }
+    }
+"""
 # Fetches a single Media's immediate relations by AniList id. Used to walk a franchise's
 # prequel/sequel chain one hop at a time when the nested GRAPHQL_QUERY runs out of depth.
 GRAPHQL_NODE_QUERY = """

@@ -28,7 +28,7 @@ class ApiTests(unittest.TestCase):
         with patch.object(api, 'get_discussion', return_value={'message': {}}) as provider:
             response = self.client.post('/discussion', json={'anime': ' Example ', 'season': 'MOVIE', 'episode': '1'})
             self.assertEqual(response.status_code, 200)
-            provider.assert_called_once_with(anime_query='Example', season='movie', episode=1)
+            provider.assert_called_once_with(anime_query='Example', season='movie', episode=1, mal_id=None)
 
     def test_provider_failures_have_stable_responses(self):
         for error, status in [(requests.Timeout(), 504), (requests.ConnectionError(), 502), (ValueError(), 502)]:
@@ -414,6 +414,73 @@ class ApiTests(unittest.TestCase):
                 preflight = self.client.options('/discussion', headers={
                     'Origin': origin, 'Access-Control-Request-Method': 'POST'})
                 self.assertNotIn('Access-Control-Allow-Origin', preflight.headers)
+
+    def test_show_search_returns_picker_cards(self):
+        response = Mock(status_code=200)
+        response.json.return_value = {'data': {'Page': {'media': [
+            {'id': 99, 'idMal': 36688, 'format': 'OVA', 'episodes': 1, 'seasonYear': None, 'startDate': {'year': 2018},
+             'title': {'romaji': 'Shinmai Maou no Testament: DEPARTURES',
+                       'english': 'The Testament of Sister New Devil DEPARTURES', 'native': '新妹魔王の契約者 DEPARTURES'},
+             'coverImage': {'large': 'https://s4.anilist.co/file/large.jpg', 'medium': 'https://s4.anilist.co/file/medium.jpg'}},
+            {'id': 100, 'idMal': None, 'format': 'TV', 'title': {'romaji': 'No MAL entry'}},
+            {'id': 101, 'idMal': 23233, 'format': 'TV', 'episodes': 12, 'seasonYear': 2015,
+             'title': {'romaji': 'Shinmai Maou no Testament', 'english': None, 'native': '新妹魔王の契約者'},
+             'coverImage': {'large': 'http://insecure.example/cover.jpg'}}]}}}
+        with patch.object(discussion.requests, 'post', return_value=response) as post:
+            first = self.client.post('/search', json={'q': '  Testament  '})
+            second = self.client.post('/search', json={'q': 'testament'})
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.json['results'], [
+            {'mal_id': 36688, 'title': 'The Testament of Sister New Devil DEPARTURES',
+             'romaji': 'Shinmai Maou no Testament: DEPARTURES', 'native': '新妹魔王の契約者 DEPARTURES',
+             'format': 'OVA', 'episodes': 1, 'year': 2018, 'cover': 'https://s4.anilist.co/file/large.jpg'},
+            {'mal_id': 23233, 'title': 'Shinmai Maou no Testament', 'romaji': 'Shinmai Maou no Testament',
+             'native': '新妹魔王の契約者', 'format': 'TV', 'episodes': 12, 'year': 2015, 'cover': None}])
+        self.assertEqual(second.json, first.json)
+        self.assertEqual(post.call_count, 1)  # normalized queries share the cache
+
+    def test_show_search_validates_input_and_failures(self):
+        with patch.object(discussion.requests, 'post') as post:
+            for body in [None, {}, {'q': 'a'}, {'q': 'x' * 101}, {'q': ['list']}]:
+                with self.subTest(body=body):
+                    self.assertEqual(self.client.post('/search', json=body).status_code, 400)
+            post.assert_not_called()
+        with patch.object(discussion.requests, 'post', side_effect=requests.Timeout()):
+            self.assertEqual(self.client.post('/search', json={'q': 'Example'}).status_code, 504)
+        self.assertEqual(self.client.get('/search?q=Example').status_code, 405)  # queries stay out of URLs
+
+    def test_extension_origins_may_search(self):
+        origin = 'moz-extension://2d5b1806-249f-4b54-937c-9dd8f218c52f'
+        preflight = self.client.options('/search', headers={'Origin': origin, 'Access-Control-Request-Method': 'POST',
+                                                             'Access-Control-Request-Headers': 'content-type'})
+        self.assertEqual(preflight.headers.get('Access-Control-Allow-Origin'), origin)
+
+    def test_picked_entry_skips_title_resolution(self):
+        with patch.object(api, 'get_discussion', return_value={'message': {}}) as provider:
+            response = self.client.post('/discussion', json={'anime': 'Shinmai Maou no Testament: DEPARTURES',
+                                                              'season': 0, 'episode': 1, 'mal_id': 36688})
+        self.assertEqual(response.status_code, 200)
+        provider.assert_called_once_with(anime_query='Shinmai Maou no Testament: DEPARTURES', season='0',
+                                         episode=1, mal_id=36688)
+        for bad in [0, -5, True, 'abc', 123456789]:
+            with self.subTest(mal_id=bad):
+                self.assertEqual(self.client.post('/discussion', json={
+                    'anime': 'Example', 'season': 1, 'episode': 1, 'mal_id': bad}).status_code, 400)
+        with api.app.app_context(), \
+                patch.object(discussion, 'resolve_mal_id_with_split_cour') as resolve, \
+                patch.object(discussion, 'get_discussion_link', return_value='777') as link, \
+                patch.object(discussion, 'fetch_mal_topic', return_value=(None, {'title': 'T', 'posts': []})):
+            discussion.get_discussion('Shinmai Maou no Testament: DEPARTURES', '0', 1, mal_id=36688)
+        resolve.assert_not_called()
+        link.assert_called_once_with('Shinmai_Maou_no_Testament:_DEPARTURES', 36688, 1)
+
+    def test_ova_season_accepts_an_entry_that_is_itself_the_ova(self):
+        base = {'id': 99, 'idMal': 36688, 'format': 'OVA', 'episodes': 1,
+                'title': {'romaji': 'Shinmai Maou no Testament: DEPARTURES',
+                          'english': 'The Testament of Sister New Devil DEPARTURES'}, 'relations': {'edges': []}}
+        with api.app.app_context(), patch.object(discussion, 'fetch_season_tree', return_value=base):
+            self.assertEqual(discussion.resolve_mal_id_with_split_cour(
+                'The Testament of Sister New Devil DEPARTURES', 'ova', 1)[:2], (36688, 1))
 
 if __name__ == '__main__':
     unittest.main()
