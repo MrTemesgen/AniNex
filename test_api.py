@@ -1,4 +1,6 @@
 import sys
+import threading
+import time
 import unittest
 from unittest.mock import patch, Mock
 sys.path.insert(0, '.deps')
@@ -11,6 +13,8 @@ class ApiTests(unittest.TestCase):
     def setUp(self):
         self.client = api.app.test_client()
         discussion.clear_caches()
+        for limiter in api.RATE_LIMITS.values():
+            limiter.hits.clear()
 
     def test_invalid_input_does_not_call_provider(self):
         bad = [None, [], {}, {'anime': 'X', 'season': '1', 'episode': '0'},
@@ -313,24 +317,99 @@ class ApiTests(unittest.TestCase):
                                   'paging': {'next': 'more'} if has_next else {}}
         return page
 
+    def _mal_pages_by_offset(self, pages):
+        """Fake MAL topic API answering by offset (later pages are fetched in parallel)."""
+        def get(url, params, headers, timeout):
+            page = pages.get(params['offset'])
+            if isinstance(page, Exception):
+                raise page
+            return page or self._mal_page([], False)  # past the end: empty, like MAL
+        return get
+
     def test_mal_topic_pages_past_the_first_hundred_posts(self):
         first = [{'id': n} for n in range(100)]
         second = [{'id': n} for n in range(99, 130)]  # one repeat from a deletion mid-walk
-        with api.app.app_context(), patch.object(discussion.requests, 'get', side_effect=[
-                self._mal_page(first, True), self._mal_page(second, False)]) as get:
+        with api.app.app_context(), patch.object(discussion.requests, 'get', side_effect=self._mal_pages_by_offset(
+                {0: self._mal_page(first, True), 100: self._mal_page(second, False)})) as get:
             error, topic = discussion.fetch_mal_topic('42')
         self.assertIsNone(error)
         self.assertEqual([post['id'] for post in topic['posts']], list(range(130)))
         self.assertNotIn('truncated', topic)
-        self.assertEqual([call.kwargs['params']['offset'] for call in get.call_args_list], [0, 100])
+        offsets = sorted(call.kwargs['params']['offset'] for call in get.call_args_list)
+        self.assertEqual(offsets[:2], [0, 100])
+        self.assertLessEqual(len(offsets), 1 + discussion.MAL_TOPIC_PARALLEL_PAGES)
+
+    def test_mal_topic_later_pages_are_fetched_in_parallel(self):
+        pages = {offset: self._mal_page([{'id': offset + n} for n in range(100)], True) for offset in range(0, 600, 100)}
+        pages[500] = self._mal_page([{'id': 500 + n} for n in range(40)], False)
+        active, peak, lock = [0], [0], threading.Lock()
+        fake = self._mal_pages_by_offset(pages)
+
+        def slow_get(url, params, headers, timeout):
+            with lock:
+                active[0] += 1
+                peak[0] = max(peak[0], active[0])
+            time.sleep(0.05)
+            with lock:
+                active[0] -= 1
+            return fake(url, params, headers, timeout)
+
+        with api.app.app_context(), patch.object(discussion.requests, 'get', side_effect=slow_get):
+            error, topic = discussion.fetch_mal_topic('42')
+        self.assertEqual([post['id'] for post in topic['posts']], list(range(540)))
+        self.assertNotIn('truncated', topic)
+        self.assertGreater(peak[0], 1)
 
     def test_mal_topic_keeps_first_pages_when_a_later_page_fails(self):
-        with api.app.app_context(), patch.object(discussion.requests, 'get', side_effect=[
-                self._mal_page([{'id': n} for n in range(100)], True), requests.Timeout()]):
+        with api.app.app_context(), patch.object(discussion.requests, 'get', side_effect=self._mal_pages_by_offset(
+                {0: self._mal_page([{'id': n} for n in range(100)], True), 100: requests.Timeout()})):
             error, topic = discussion.fetch_mal_topic('42')
         self.assertIsNone(error)
         self.assertEqual(len(topic['posts']), 100)
         self.assertTrue(topic['truncated'])
+
+    def test_repeat_lookups_skip_resolution_and_thread_search(self):
+        topic = (None, {'title': 'Episode 1 Discussion', 'posts': []})
+        with api.app.app_context(),                 patch.object(discussion, 'resolve_mal_id_with_split_cour', return_value=(21, 339, 'ONE_PIECE')) as resolve,                 patch.object(discussion, 'get_discussion_link', return_value='777') as link,                 patch.object(discussion, 'fetch_mal_topic', return_value=topic):
+            for _ in range(3):
+                discussion.get_discussion('One Piece', '12', 339)
+            discussion.get_discussion('ONE PIECE', '12', 339)  # same title, other case
+        self.assertEqual(resolve.call_count, 1)
+        self.assertEqual(link.call_count, 1)
+
+    def test_lookup_misses_are_not_cached(self):
+        with api.app.app_context(),                 patch.object(discussion, 'resolve_mal_id_with_split_cour', return_value=(None, 1, 'X')) as resolve,                 patch.object(discussion, 'fallback_mal_search', return_value=None):
+            discussion.get_discussion('New Show', '1', 1)
+            discussion.get_discussion('New Show', '1', 1)
+        self.assertEqual(resolve.call_count, 2)
+        with api.app.app_context(),                 patch.object(discussion, 'resolve_mal_id_with_split_cour', return_value=(5, 1, 'X')),                 patch.object(discussion, 'get_discussion_link', return_value=None) as link,                 patch.object(discussion, 'fallback_forum_search', return_value=None):
+            discussion.get_discussion('Airing Show', '1', 1)
+            discussion.get_discussion('Airing Show', '1', 1)
+        self.assertEqual(link.call_count, 2)  # a thread posted later must still be found
+
+    def test_requests_are_rate_limited_per_client(self):
+        limiter = api.RateLimiter(3, 60, clock=lambda: clock[0])
+        clock = [0.0]
+        with patch.dict(api.RATE_LIMITS, {'/discussion': limiter}),                 patch.object(api, 'get_discussion', return_value={'message': {}}):
+            body = {'anime': 'Example', 'season': 1, 'episode': 1}
+            statuses = [self.client.post('/discussion', json=body, headers={'X-Forwarded-For': '9.9.9.9, 1.2.3.4'}).status_code
+                        for _ in range(4)]
+            # The router-appended (last) address is the client; a forged first entry can't dodge it.
+            dodge = self.client.post('/discussion', json=body, headers={'X-Forwarded-For': '8.8.8.8, 1.2.3.4'})
+            other = self.client.post('/discussion', json=body, headers={'X-Forwarded-For': '5.6.7.8'})
+            clock[0] = 61.0
+            later = self.client.post('/discussion', json=body, headers={'X-Forwarded-For': '1.2.3.4'})
+        self.assertEqual(statuses, [200, 200, 200, 429])
+        self.assertEqual(dodge.status_code, 429)
+        self.assertEqual(dodge.headers.get('Retry-After'), '30')
+        self.assertEqual(other.status_code, 200)
+        self.assertEqual(later.status_code, 200)
+
+    def test_procfile_uses_threaded_workers(self):
+        with open('Procfile', encoding='utf-8') as procfile:
+            command = procfile.read()
+        self.assertIn('--worker-class gthread', command)
+        self.assertIn('--workers 1', command)
 
     @staticmethod
     def _mal_thread_with_unreadable(total, unreadable):
@@ -484,7 +563,8 @@ class ApiTests(unittest.TestCase):
                 with self.subTest(body=body):
                     self.assertEqual(self.client.post('/search', json=body).status_code, 400)
             post.assert_not_called()
-        with patch.object(discussion.requests, 'post', side_effect=requests.Timeout()):
+        # Both catalogs timing out (AniList, then the MAL fallback) is a 504.
+        with patch.object(discussion.requests, 'post', side_effect=requests.Timeout()),                 patch.object(discussion.requests, 'get', side_effect=requests.Timeout()):
             self.assertEqual(self.client.post('/search', json={'q': 'Example'}).status_code, 504)
         self.assertEqual(self.client.get('/search?q=Example').status_code, 405)  # queries stay out of URLs
 
@@ -520,6 +600,94 @@ class ApiTests(unittest.TestCase):
         with api.app.app_context(), patch.object(discussion, 'fetch_season_tree', return_value=base):
             self.assertEqual(discussion.resolve_mal_id_with_split_cour(
                 'The Testament of Sister New Devil DEPARTURES', 'ova', 1)[:2], (36688, 1))
+
+    @staticmethod
+    def _anilist_disabled():
+        # AniList's real outage answer (Oct 21): 403 "temporarily disabled".
+        response = Mock(status_code=403)
+        response.json.return_value = {'errors': [{'message': 'The AniList API has been temporarily disabled due to severe stability issues.', 'status': 403}], 'data': None}
+        response.raise_for_status.side_effect = requests.HTTPError()
+        return response
+
+    def test_picker_search_falls_back_to_mal_when_anilist_is_down(self):
+        mal = Mock(status_code=200)
+        mal.json.return_value = {'data': [
+            {'node': {'id': 36688, 'title': 'Shinmai Maou no Testament Departures', 'media_type': 'ova', 'num_episodes': 1,
+                      'start_season': {'year': 2018}, 'nsfw': 'white',
+                      'alternative_titles': {'en': 'The Testament of Sister New Devil Departures', 'ja': '新妹魔王の契約者 DEPARTURES'},
+                      'main_picture': {'large': 'https://cdn.myanimelist.net/images/anime/1395/95778l.jpg'}}},
+            {'node': {'id': 999, 'title': 'Adult entry', 'nsfw': 'black'}},
+            {'node': {'id': 23233, 'title': 'Shinmai Maou no Testament', 'media_type': 'tv', 'num_episodes': 0,
+                      'nsfw': 'gray', 'main_picture': {'large': 'http://insecure/cover.jpg'}}}]}
+        with patch.object(discussion.requests, 'post', return_value=self._anilist_disabled()), \
+                patch.object(discussion.requests, 'get', return_value=mal) as get:
+            response = self.client.post('/search', json={'q': 'testament departures'})
+            again = self.client.post('/search', json={'q': 'testament departures'})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json['results'], [
+            {'mal_id': 36688, 'title': 'The Testament of Sister New Devil Departures', 'romaji': 'Shinmai Maou no Testament Departures',
+             'native': '新妹魔王の契約者 DEPARTURES', 'format': 'OVA', 'episodes': 1, 'year': 2018,
+             'cover': 'https://cdn.myanimelist.net/images/anime/1395/95778l.jpg'},
+            {'mal_id': 23233, 'title': 'Shinmai Maou no Testament', 'romaji': 'Shinmai Maou no Testament', 'native': None,
+             'format': 'TV', 'episodes': None, 'year': None, 'cover': None}])
+        self.assertEqual(again.json, response.json)
+        self.assertEqual(get.call_count, 2)  # degraded results are not cached
+        self.assertEqual(get.call_args.kwargs['params']['q'], 'testament departures')
+
+    def test_picker_fallback_skips_queries_mal_rejects(self):
+        with patch.object(discussion.requests, 'post', return_value=self._anilist_disabled()), \
+                patch.object(discussion.requests, 'get') as get:
+            self.assertEqual(self.client.post('/search', json={'q': 'ab'}).json, {'results': []})
+        get.assert_not_called()
+
+    def test_lookups_fall_back_to_mal_search_when_anilist_is_down(self):
+        topic = (None, {'title': 'Haikyuu!! Episode 11 Discussion', 'posts': []})
+        with api.app.app_context(), \
+                patch.object(discussion.requests, 'post', return_value=self._anilist_disabled()), \
+                patch.object(discussion, 'fallback_mal_search', return_value=20583) as mal_search, \
+                patch.object(discussion, 'get_discussion_link', return_value='1200997') as link, \
+                patch.object(discussion, 'fetch_mal_topic', return_value=topic):
+            response = discussion.get_discussion('Haikyu!!', '1', 11)
+            discussion.get_discussion('Haikyu!!', '1', 11)
+        self.assertEqual(response.get_json()['message']['title'], 'Haikyuu!! Episode 11 Discussion')
+        mal_search.assert_called_with('Haikyu!!', '1', exact_only=False)
+        link.assert_called_once_with('Haikyu!!', 20583, 11)  # thread id cached; resolution is not
+        self.assertEqual(mal_search.call_count, 2)
+    def test_mal_search_prefers_an_exact_title_over_a_later_season(self):
+        response = Mock(status_code=200)
+        response.json.return_value = {'data': [
+            {'node': {'id': 59978, 'title': 'Sousou no Frieren 2nd Season',
+                      'alternative_titles': {'en': "Frieren: Beyond Journey's End Season 2"}}},
+            {'node': {'id': 52991, 'title': 'Sousou no Frieren',
+                      'alternative_titles': {'en': "Frieren: Beyond Journey’s End"}}}]}
+        with api.app.app_context(), patch.object(discussion.requests, 'get', return_value=response):
+            self.assertEqual(discussion.fallback_mal_search("Frieren: Beyond Journey's End", '1'), 52991)
+            self.assertEqual(discussion.fallback_mal_search("Frieren: Beyond Journey's End", '2'), 59978)
+    def test_outage_fallback_uses_plain_title_only_for_absolute_numbers(self):
+        topic = (None, {'title': 'One Piece Episode 339 Discussion', 'posts': []})
+        searches = []
+
+        def mal_search(anime, season, exact_only=False):
+            searches.append(season)
+            return 21 if season == '1' else None
+
+        with api.app.app_context(),                 patch.object(discussion.requests, 'post', return_value=self._anilist_disabled()),                 patch.object(discussion, 'fallback_mal_search', side_effect=mal_search),                 patch.object(discussion, 'get_discussion_link', return_value='9') as link,                 patch.object(discussion, 'fetch_mal_topic', return_value=topic):
+            discussion.get_discussion('One Piece', '12', 339)
+            self.assertEqual(searches, ['12', '1'])
+            link.assert_called_once_with('One_Piece', 21, 339)
+            searches.clear()
+            # A small number in a later season is local to it: don't guess season 1.
+            response = discussion.get_discussion('Demon Slayer: Kimetsu no Yaiba', '4', 1)
+        self.assertEqual(searches, ['4'])
+        self.assertEqual(response.get_json()['message'], discussion.constants.MESSAGE_MAL_ID_NOT_FOUND)
+    def test_outage_season_search_only_accepts_exact_names(self):
+        response = Mock(status_code=200)
+        response.json.return_value = {'data': [
+            {'node': {'id': 61967, 'title': 'Black Clover 2nd Season', 'alternative_titles': {'en': 'Black Clover Season 2'}}}]}
+        with api.app.app_context(), patch.object(discussion.requests, 'get', return_value=response):
+            self.assertEqual(discussion.fallback_mal_search('Black Clover', '3'), 61967)  # normal mode: named entry
+            self.assertIsNone(discussion.fallback_mal_search('Black Clover', '3', exact_only=True))
+            self.assertEqual(discussion.fallback_mal_search('Black Clover', '2', exact_only=True), 61967)
 
 if __name__ == '__main__':
     unittest.main()

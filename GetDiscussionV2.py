@@ -6,11 +6,12 @@ import os
 import unicodedata
 from datetime import datetime, timezone
 from threading import Lock
-from time import monotonic
+from time import monotonic, perf_counter
+from concurrent.futures import ThreadPoolExecutor
 import constants
 from urllib.parse import urljoin
 from scrape_cache import scrape_result_cache
-from request_timing import timed
+from request_timing import timed, record as record_timing
 
 CLIENT_ID = os.getenv('CLIENT_ID')
 
@@ -56,10 +57,13 @@ _SEARCH_CACHE = _TTLCache(ttl=3600, max_entries=512)  # search term -> AniList i
 _TREE_CACHE = _TTLCache(ttl=3600, max_entries=256)    # AniList id -> nested season tree
 _NODE_CACHE = _TTLCache(ttl=3600, max_entries=512)    # AniList id -> immediate relations
 _TOPIC_CACHE = _TTLCache(ttl=60, max_entries=128)     # MAL topic id -> assembled topic
+_RESOLUTION_CACHE = _TTLCache(ttl=6 * 3600, max_entries=4096)     # (title, season, episode) -> MAL entry
+_DISCUSSION_ID_CACHE = _TTLCache(ttl=24 * 3600, max_entries=8192)  # (MAL id, episode) -> topic id
 
 
 def clear_caches():
-    for cache in (_SEARCH_CACHE, _TREE_CACHE, _NODE_CACHE, _TOPIC_CACHE, _PICKER_CACHE):
+    for cache in (_SEARCH_CACHE, _TREE_CACHE, _NODE_CACHE, _TOPIC_CACHE, _PICKER_CACHE,
+                  _RESOLUTION_CACHE, _DISCUSSION_ID_CACHE):
         cache.clear()
 
 
@@ -384,7 +388,7 @@ def _franchise_root(node):
 # 2. RESOLVERS & FALLBACKS
 # ---------------------------------------------------------
 
-def fallback_mal_search(anime_query, season):
+def fallback_mal_search(anime_query, season, exact_only=False):
     if not anime_query:
         return None
         
@@ -396,30 +400,39 @@ def fallback_mal_search(anime_query, season):
         
     try:
         url = constants.MAL_ANIME_URL
-        params = {'q': search_term, 'limit': 5, 'fields': 'alternative_titles'}
+        params = {'q': search_term, 'limit': 10, 'fields': 'alternative_titles'}
         with timed('mal_anime_search'):
             response = requests.get(url, params=params, headers={'X-MAL-CLIENT-ID': CLIENT_ID}, timeout=10)
         
         if response.status_code == 200:
             # MAL's ranking ignores the title for unknown seasons: "Yu-Gi-Oh! Season 3"
-            # ranks Gintama° first. Only accept an entry named after the show.
-            for item in response.json().get('data', []):
-                node = item.get('node') or {}
-                if _mal_titles_contain(node, anime_query):
-                    return node.get('id')
+            # ranks Gintama° first. Only accept an entry named after the show, and prefer
+            # one titled exactly as searched: "Frieren: Beyond Journey's End" otherwise
+            # picks the more recent 2nd Season, which also contains the name.
+            nodes = [item.get('node') or {} for item in response.json().get('data', [])]
+            named = [node for node in nodes if _mal_titles_contain(node, anime_query)]
+            exact = [node for node in named if _title_key(search_term) in _mal_title_keys(node)]
+            # exact_only: during an AniList outage a near miss ("Black Clover Season 3" finding
+            # the newer "Black Clover 2nd Season") can't be checked, so only accept the exact name.
+            matches = exact if exact_only else (exact or named)
+            if matches:
+                return matches[0].get('id')
     except Exception as e:
         current_app.logger.warning("Discussion provider request failed.")
         
     return None
 
 
-def _mal_titles_contain(node, anime_query):
-    wanted = _title_key(anime_query)
+def _mal_title_keys(node):
     alternative = node.get('alternative_titles') or {}
     titles = [node.get('title'), alternative.get('en'), alternative.get('ja')]
     titles += alternative.get('synonyms') or []
-    return bool(wanted) and any(
-        f' {wanted} ' in f' {_title_key(title)} ' for title in titles if isinstance(title, str))
+    return {_title_key(title) for title in titles if isinstance(title, str) and title}
+
+
+def _mal_titles_contain(node, anime_query):
+    wanted = _title_key(anime_query)
+    return bool(wanted) and any(f' {wanted} ' in f' {title} ' for title in _mal_title_keys(node))
 
 def resolve_mal_id_with_split_cour(anime_query, season, episode):
     target_ep = int(episode)
@@ -748,13 +761,69 @@ def _picker_cover(media):
     return None
 
 
+_MAL_MEDIA_TYPES = {'tv': 'TV', 'ova': 'OVA', 'movie': 'MOVIE', 'special': 'SPECIAL', 'tv_special': 'SPECIAL',
+                    'ona': 'ONA', 'music': 'MUSIC'}
+
+
+def _search_shows_mal(query):
+    """Picker results from MyAnimeList's own search, used while AniList is unavailable.
+    MAL matches English and romaji names (not kanji) and needs at least 3 characters."""
+    if len(query) < 3:
+        return []
+    with timed('mal_picker_search'):
+        res = requests.get(constants.MAL_ANIME_URL, params={
+            'q': query[:64], 'limit': 12,
+            'fields': 'alternative_titles,media_type,num_episodes,start_season,nsfw,main_picture'},
+            headers={'X-MAL-CLIENT-ID': CLIENT_ID}, timeout=10)
+    if res.status_code == 400:  # MAL rejects some queries ("invalid q") rather than matching nothing
+        return []
+    res.raise_for_status()
+    payload = res.json()
+    rows = payload.get('data') if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        raise ValueError('Invalid MAL search results')
+    results = []
+    for row in rows:
+        node = row.get('node') if isinstance(row, dict) else None
+        if not isinstance(node, dict) or not isinstance(node.get('id'), int) or isinstance(node.get('id'), bool):
+            continue
+        if node.get('nsfw') == 'black':  # adult entries, as AniList's isAdult filter excludes
+            continue
+        alternative = node.get('alternative_titles') or {}
+        picture = node.get('main_picture') or {}
+        cover = next((url for url in (picture.get('large'), picture.get('medium'))
+                      if isinstance(url, str) and url.startswith('https://')), None)
+        results.append({
+            'mal_id': node['id'],
+            'title': alternative.get('en') or node.get('title'),
+            'romaji': node.get('title'),
+            'native': alternative.get('ja') or None,
+            'format': _MAL_MEDIA_TYPES.get(node.get('media_type')),
+            'episodes': node.get('num_episodes') or None,
+            'year': (node.get('start_season') or {}).get('year'),
+            'cover': cover,
+        })
+    return results
+
+
 def search_shows(query):
     """Picker results for a user's search: entries with a MAL id, with titles in every
-    script AniList has (English, romaji, native) and cover art."""
+    script AniList has (English, romaji, native) and cover art. Falls back to MAL's own
+    search while AniList is unavailable; fallback results aren't cached."""
     key = _title_key(query)
     hit, results = _PICKER_CACHE.get(key)
     if hit:
         return results
+    try:
+        results = _search_shows_anilist(query)
+    except (requests.RequestException, ValueError):
+        current_app.logger.warning("Catalog provider unavailable; searching MyAnimeList instead.")
+        return _search_shows_mal(query)
+    _PICKER_CACHE.set(key, results)
+    return results
+
+
+def _search_shows_anilist(query):
     with timed('anilist_picker_search'):
         res = requests.post(constants.ANILIST_API_URL, json={
             'query': constants.GRAPHQL_PICKER_QUERY, 'variables': {'search': query}}, timeout=10)
@@ -782,7 +851,6 @@ def search_shows(query):
             'year': item.get('seasonYear') or (item.get('startDate') or {}).get('year'),
             'cover': _picker_cover(item),
         })
-    _PICKER_CACHE.set(key, results)
     return results
 
 
@@ -791,20 +859,46 @@ def get_discussion(anime_query, season, episode, mal_id=None):
         # The user picked this exact entry; its episode numbering is the displayed one.
         mal_id, local_ep, anime_slug = mal_id, episode, anime_query.replace(' ', '_')
     else:
-        # Use our hybrid split-cour resolver
-        mal_id, local_ep, anime_slug = resolve_mal_id_with_split_cour(anime_query, season, episode)
+        # Repeat views of an episode skip the AniList walk entirely.
+        resolution_key = (_title_key(anime_query), season, episode)
+        hit, resolved = _RESOLUTION_CACHE.get(resolution_key)
+        if hit:
+            mal_id, local_ep, anime_slug = resolved
+        else:
+            try:
+                # Use our hybrid split-cour resolver
+                mal_id, local_ep, anime_slug = resolve_mal_id_with_split_cour(anime_query, season, episode)
+                if mal_id:  # misses aren't cached: a newly listed show should resolve soon
+                    _RESOLUTION_CACHE.set(resolution_key, (mal_id, local_ep, anime_slug))
+            except (requests.RequestException, ValueError):
+                # AniList is unavailable (e.g. 403 "temporarily disabled"). MAL's own search
+                # still finds the show, only accepting entries named after it; split-cour
+                # renumbering needs AniList, so the episode is used as displayed. Not cached.
+                current_app.logger.warning("Catalog provider unavailable; using MyAnimeList search.")
+                mal_id, local_ep = fallback_mal_search(anime_query, season, exact_only=season.isdigit() and int(season) > 1), episode
+                anime_slug = anime_query.replace(' ', '_')
+                if (not mal_id and season.isdigit() and int(season) > 1
+                        and _clearly_absolute(int(episode), int(season))):
+                    # Long series split into numbered seasons keep their absolute numbers
+                    # (One Piece S12 E339): the plain title's entry holds the episode.
+                    mal_id = fallback_mal_search(anime_query, '1')
 
     if not mal_id:
         return jsonify(message=constants.MESSAGE_MAL_ID_NOT_FOUND)
 
-    # 1. Scrape the discussion ID
-    discussion_id = get_discussion_link(anime_slug, mal_id, local_ep)
-    
-    # 2. Direct forum search fallback
-    if not discussion_id:
-        current_app.logger.info("Scraping failed. Attempting direct forum search...")
-        clean_title = anime_slug.replace('_', ' ') if anime_slug else anime_query
-        discussion_id = fallback_forum_search(clean_title, local_ep)
+    hit, discussion_id = _DISCUSSION_ID_CACHE.get((mal_id, local_ep))
+    if not hit:
+        # 1. Scrape the discussion ID
+        discussion_id = get_discussion_link(anime_slug, mal_id, local_ep)
+
+        # 2. Direct forum search fallback
+        if not discussion_id:
+            current_app.logger.info("Scraping failed. Attempting direct forum search...")
+            clean_title = anime_slug.replace('_', ' ') if anime_slug else anime_query
+            discussion_id = fallback_forum_search(clean_title, local_ep)
+        # A found thread never changes; a missing one may be posted when the episode airs.
+        if discussion_id:
+            _DISCUSSION_ID_CACHE.set((mal_id, local_ep), discussion_id)
 
     if not discussion_id:
         return jsonify(message=constants.MESSAGE_DISCUSSION_NOT_FOUND)
@@ -825,6 +919,7 @@ def get_discussion(anime_query, season, episode, mal_id=None):
 MAL_TOPIC_PAGE_SIZE = 100  # MAL's maximum page size for topic posts
 MAL_TOPIC_MAX_PAGES = 10
 MAL_TOPIC_FETCH_BUDGET_SECONDS = 8  # keep well inside the extension's 25 s request timeout
+MAL_TOPIC_PARALLEL_PAGES = 3  # later pages fetched concurrently
 
 
 def _mal_error_code(mal_data):
@@ -888,9 +983,39 @@ def _fetch_around_unreadable(url, offset, limit, deadline):
     return data, posts, covered, True
 
 
+def _read_topic_page(url, offset, deadline):
+    """One 100-post page: {'error': code} for MAL's error payload, else the page's topic data,
+    posts, positions covered (incl. skipped unreadable posts), completeness and paging."""
+    response, mal_data = _get_topic_page(url, offset, MAL_TOPIC_PAGE_SIZE)
+    if 'error' in mal_data:
+        return {'error': _mal_error_code(mal_data)}
+    if _is_unreadable_page(response, mal_data):
+        data, page_posts, covered, complete = _fetch_around_unreadable(url, offset, MAL_TOPIC_PAGE_SIZE, deadline)
+        return {'data': data, 'posts': page_posts, 'covered': covered, 'complete': complete, 'paging': None}
+    data, page_posts = _page_data(response, mal_data)
+    return {'data': data, 'posts': page_posts, 'covered': len(page_posts), 'complete': True,
+            'paging': mal_data.get('paging')}
+
+
+def _ends_thread(page):
+    paging = page.get('paging')
+    return page['covered'] < MAL_TOPIC_PAGE_SIZE or (isinstance(paging, dict) and not paging.get('next'))
+
+
+def _read_topic_page_timed(url, offset, deadline):
+    # Runs on a pool thread: no request context, so time it here and record on the caller.
+    started = perf_counter()
+    try:
+        return _read_topic_page(url, offset, deadline), None, perf_counter() - started
+    except (requests.RequestException, ValueError) as error:
+        return None, error, perf_counter() - started
+
+
 def fetch_mal_topic(discussion_id):
     """Every post of a MAL topic, paging past MAL's 100-post limit so popular episodes
-    show their recent replies, not just the first 100. Returns (error_code, topic)."""
+    show their recent replies, not just the first 100. Returns (error_code, topic).
+    After the first page, later pages are fetched a few at a time in parallel (pages past
+    the end come back empty), so a 600-post thread costs ~2 round trips instead of 6."""
     topic_id = int(discussion_id)
     hit, cached = _TOPIC_CACHE.get(topic_id)
     if hit:
@@ -898,36 +1023,16 @@ def fetch_mal_topic(discussion_id):
 
     url = f"https://api.myanimelist.net/v2/forum/topic/{topic_id}"
     deadline = monotonic() + MAL_TOPIC_FETCH_BUDGET_SECONDS
-    topic, posts, seen = None, [], set()
-    truncated = True
-    for page in range(MAL_TOPIC_MAX_PAGES):
-        if page and monotonic() > deadline:
-            break
-        offset = page * MAL_TOPIC_PAGE_SIZE
-        try:
-            response, mal_data = _get_topic_page(url, offset, MAL_TOPIC_PAGE_SIZE)
-            if 'error' in mal_data:
-                current_app.logger.warning("Discussion provider request failed.")
-                if page == 0:
-                    return _mal_error_code(mal_data), None
-                break
-            if _is_unreadable_page(response, mal_data):
-                data, page_posts, covered, complete = _fetch_around_unreadable(
-                    url, offset, MAL_TOPIC_PAGE_SIZE, deadline)
-                paging = None
-            else:
-                data, page_posts = _page_data(response, mal_data)
-                covered, complete, paging = len(page_posts), True, mal_data.get('paging')
-            if topic is None and data is None:
-                raise ValueError('No readable MAL posts')
-        except (requests.RequestException, ValueError):
-            # The first page decides success; a later page failing keeps what we have.
-            if page == 0:
-                raise
-            current_app.logger.warning("Discussion provider request failed.")
-            break
-        if topic is None:
-            topic = dict(data)
+    # The first page decides success: errors propagate, MAL's error codes are returned.
+    first = _read_topic_page(url, 0, deadline)
+    if 'error' in first:
+        current_app.logger.warning("Discussion provider request failed.")
+        return first['error'], None
+    if first['data'] is None:
+        raise ValueError('No readable MAL posts')
+    topic, posts, seen = dict(first['data']), [], set()
+
+    def add(page_posts):
         for post in page_posts:
             # Posts deleted mid-walk shift later pages back; skip the repeats.
             key = post.get('id') if isinstance(post, dict) else None
@@ -935,11 +1040,33 @@ def fetch_mal_topic(discussion_id):
                 continue
             seen.add(key)
             posts.append(post)
-        if not complete:
-            break
-        if covered < MAL_TOPIC_PAGE_SIZE or (isinstance(paging, dict) and not paging.get('next')):
-            truncated = False
-            break
+
+    add(first['posts'])
+    truncated = not first['complete'] or not _ends_thread(first)
+    if first['complete'] and truncated:
+        page = 1
+        with ThreadPoolExecutor(max_workers=MAL_TOPIC_PARALLEL_PAGES) as pool:
+            while truncated and page < MAL_TOPIC_MAX_PAGES and monotonic() <= deadline:
+                batch = range(page, min(page + MAL_TOPIC_PARALLEL_PAGES, MAL_TOPIC_MAX_PAGES))
+                results = pool.map(lambda number: _read_topic_page_timed(url, number * MAL_TOPIC_PAGE_SIZE, deadline), batch)
+                stop = False
+                for result, error, elapsed in results:  # in page order
+                    record_timing('mal_topic_page', elapsed)
+                    if stop:
+                        continue
+                    if error is not None or 'error' in result:
+                        # A later page failing keeps what we have, marked truncated.
+                        current_app.logger.warning("Discussion provider request failed.")
+                        stop = True
+                        continue
+                    add(result['posts'])
+                    if not result['complete']:
+                        stop = True
+                    elif _ends_thread(result):
+                        truncated, stop = False, True
+                if stop:
+                    break
+                page += len(batch)
 
     topic['posts'] = posts
     # MAL's detail payload omits the ID; expose the thread we actually resolved.
