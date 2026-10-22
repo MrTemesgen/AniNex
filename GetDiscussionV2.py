@@ -63,7 +63,7 @@ _DISCUSSION_ID_CACHE = _TTLCache(ttl=24 * 3600, max_entries=8192)  # (MAL id, ep
 
 def clear_caches():
     for cache in (_SEARCH_CACHE, _TREE_CACHE, _NODE_CACHE, _TOPIC_CACHE, _PICKER_CACHE,
-                  _RESOLUTION_CACHE, _DISCUSSION_ID_CACHE):
+                  _RESOLUTION_CACHE, _DISCUSSION_ID_CACHE, _MAL_ANIME_CACHE):
         cache.clear()
 
 
@@ -421,6 +421,72 @@ def fallback_mal_search(anime_query, season, exact_only=False):
         current_app.logger.warning("Discussion provider request failed.")
         
     return None
+
+
+_MAL_ANIME_CACHE = _TTLCache(ttl=24 * 3600, max_entries=2048)  # MAL id -> episodes, type, prequel
+
+
+def _mal_anime_info(mal_id):
+    hit, info = _MAL_ANIME_CACHE.get(mal_id)
+    if hit:
+        return info
+    with timed('mal_anime_details'):
+        res = requests.get(f'{constants.MAL_ANIME_URL}/{int(mal_id)}', params={'fields': 'num_episodes,media_type,related_anime'},
+                           headers={'X-MAL-CLIENT-ID': CLIENT_ID}, timeout=10)
+    res.raise_for_status()
+    payload = res.json()
+    if not isinstance(payload, dict):
+        raise ValueError('Invalid MAL anime details')
+    def related(relation):
+        ids = [item.get('node', {}).get('id') for item in payload.get('related_anime') or []
+               if isinstance(item, dict) and item.get('relation_type') == relation]
+        ids = [value for value in ids if isinstance(value, int) and not isinstance(value, bool)]
+        return ids[0] if ids else None
+    episodes = payload.get('num_episodes')
+    info = {'episodes': episodes if isinstance(episodes, int) and episodes > 0 else 0,
+            'tv': payload.get('media_type') == 'tv', 'prequel': related('prequel'), 'sequel': related('sequel')}
+    _MAL_ANIME_CACHE.set(mal_id, info)
+    return info
+
+
+def _mal_locate_episode(mal_id, episode):
+    """Outage stand-in for AniList's season walk, using MAL's own relations. Returns the
+    (MAL id, episode) that holds a Crunchyroll episode number beyond the entry's count:
+    - numbered after earlier seasons (SPY x FAMILY Season 3 E38-E50 -> Season 3 E1-E13):
+      subtract the TV episodes of the prequel chain;
+    - a season MAL splits into parts (SPY x FAMILY Season 1 E24 -> Part 2 E12): walk the
+      sequel chain forward.
+    Keeps the input when unsure or when MAL can't be reached."""
+    try:
+        info = _mal_anime_info(mal_id)
+        if not info['episodes'] or episode <= info['episodes']:
+            return mal_id, episode
+        offset, current, seen = 0, info, {mal_id}
+        for _ in range(15):  # bound against cycles / runaway chains
+            previous = current['prequel']
+            if not previous or previous in seen:
+                break
+            seen.add(previous)
+            current = _mal_anime_info(previous)
+            if current['tv']:
+                offset += current['episodes']
+        if offset and 0 < episode - offset <= info['episodes']:
+            return mal_id, episode - offset
+        remaining, current_id, current, seen = episode, mal_id, info, {mal_id}
+        for _ in range(15):
+            if current['tv'] and current['episodes']:
+                if remaining <= current['episodes']:
+                    return current_id, remaining
+                remaining -= current['episodes']
+            following = current['sequel']
+            if not following or following in seen:
+                break
+            seen.add(following)
+            current_id, current = following, _mal_anime_info(following)
+        return mal_id, episode
+    except (requests.RequestException, ValueError):
+        current_app.logger.warning("Discussion provider request failed.")
+        return mal_id, episode
 
 
 def _mal_title_keys(node):
@@ -875,13 +941,18 @@ def get_discussion(anime_query, season, episode, mal_id=None):
                 # still finds the show, only accepting entries named after it; split-cour
                 # renumbering needs AniList, so the episode is used as displayed. Not cached.
                 current_app.logger.warning("Catalog provider unavailable; using MyAnimeList search.")
-                mal_id, local_ep = fallback_mal_search(anime_query, season, exact_only=season.isdigit() and int(season) > 1), episode
+                later_season = season.isdigit() and int(season) > 1
+                mal_id, local_ep = fallback_mal_search(anime_query, season, exact_only=later_season), episode
                 anime_slug = anime_query.replace(' ', '_')
-                if (not mal_id and season.isdigit() and int(season) > 1
-                        and _clearly_absolute(int(episode), int(season))):
+                if not mal_id and later_season and _clearly_absolute(int(episode), int(season)):
                     # Long series split into numbered seasons keep their absolute numbers
-                    # (One Piece S12 E339): the plain title's entry holds the episode.
+                    # (One Piece S12 E339); MAL's search can also miss a season's own entry
+                    # ("SPY x FAMILY Season 2" only finds Season 3). Start from the plain title.
                     mal_id = fallback_mal_search(anime_query, '1')
+                if mal_id:
+                    # Crunchyroll numbering beyond MAL's entry: seasons numbered after the
+                    # earlier ones, or a run of seasons/parts walked forward from the start.
+                    mal_id, local_ep = _mal_locate_episode(mal_id, episode)
 
     if not mal_id:
         return jsonify(message=constants.MESSAGE_MAL_ID_NOT_FOUND)
