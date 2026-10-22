@@ -688,6 +688,43 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(discussion.fallback_mal_search('Black Clover', '3'), 61967)  # normal mode: named entry
             self.assertIsNone(discussion.fallback_mal_search('Black Clover', '3', exact_only=True))
             self.assertEqual(discussion.fallback_mal_search('Black Clover', '2', exact_only=True), 61967)
+    @staticmethod
+    def _mal_details(chain):
+        """Fake MAL /anime/{id} details: chain = {id: (episodes, media_type, prequel id or None)}."""
+        sequels = {prequel: mal_id for mal_id, (_, _, prequel) in chain.items() if prequel}
+
+        def get(url, params, headers, timeout):
+            mal_id = int(url.rsplit('/', 1)[1])
+            episodes, media_type, prequel = chain[mal_id]
+            related = [{'node': {'id': prequel}, 'relation_type': 'prequel'}] if prequel else []
+            if mal_id in sequels:
+                related.append({'node': {'id': sequels[mal_id]}, 'relation_type': 'sequel'})
+            response = Mock(status_code=200)
+            response.json.return_value = {'id': mal_id, 'num_episodes': episodes, 'media_type': media_type,
+                                          'related_anime': related}
+            return response
+        return get
+
+    def test_outage_fallback_renumbers_continuously_numbered_seasons(self):
+        # MAL: Spy x Family Season 3 (13) <- Season 2 (12) <- Part 2 (13) <- Spy x Family (12).
+        # Crunchyroll numbers Season 3 as E38-E50.
+        chain = {59027: (13, 'tv', 53887), 53887: (12, 'tv', 50602), 50602: (13, 'tv', 50265), 50265: (12, 'tv', None)}
+        with api.app.app_context(), patch.object(discussion.requests, 'get', side_effect=self._mal_details(chain)) as get:
+            self.assertEqual(discussion._mal_locate_episode(59027, 38), (59027, 1))
+            self.assertEqual(discussion._mal_locate_episode(59027, 50), (59027, 13))
+            self.assertEqual(discussion._mal_locate_episode(59027, 5), (59027, 5))    # already local
+            self.assertEqual(discussion._mal_locate_episode(59027, 60), (59027, 60))  # past the season: unchanged
+            # Crunchyroll Season 1 (25 eps) = MAL "Spy x Family" (12) + "Part 2" (13).
+            self.assertEqual(discussion._mal_locate_episode(50265, 24), (50602, 12))
+            self.assertEqual(discussion._mal_locate_episode(50265, 7), (50265, 7))
+            # From the plain title, a later season's absolute number walks forward (S2 E26 -> Season 2 E1).
+            self.assertEqual(discussion._mal_locate_episode(50265, 26), (53887, 1))
+            self.assertEqual(discussion._mal_locate_episode(50265, 45), (59027, 8))
+            self.assertEqual(get.call_count, 4)  # details are cached
+        topic = (None, {'title': 'Spy x Family Season 3 Episode 1 Discussion', 'posts': []})
+        with api.app.app_context(),                 patch.object(discussion.requests, 'post', return_value=self._anilist_disabled()),                 patch.object(discussion, 'fallback_mal_search', return_value=59027),                 patch.object(discussion.requests, 'get', side_effect=self._mal_details(chain)),                 patch.object(discussion, 'get_discussion_link', return_value='1') as link,                 patch.object(discussion, 'fetch_mal_topic', return_value=topic):
+            discussion.get_discussion('SPY x FAMILY', '3', 38)
+        link.assert_called_once_with('SPY_x_FAMILY', 59027, 1)
 
 if __name__ == '__main__':
     unittest.main()
