@@ -5,6 +5,9 @@ import json
 import os
 import re
 import requests
+from collections import deque
+from threading import Lock
+from time import monotonic
 import request_timing
 
 app = Flask(__name__)
@@ -26,6 +29,51 @@ def allow_extension_origins(response):
         response.headers['Access-Control-Max-Age'] = '86400'
     response.vary.add('Origin')
     return response
+
+
+class RateLimiter:
+    """Per-client sliding window, in process memory (one dyno, one gunicorn process)."""
+
+    def __init__(self, limit, window_seconds, clock=monotonic):
+        self.limit = limit
+        self.window = window_seconds
+        self.clock = clock
+        self.hits = {}
+        self.lock = Lock()
+
+    def allow(self, key):
+        now = self.clock()
+        with self.lock:
+            if len(self.hits) > 10000:  # drop idle clients so memory stays bounded
+                self.hits = {k: q for k, q in self.hits.items() if q and now - q[-1] < self.window}
+            recent = self.hits.setdefault(key, deque())
+            while recent and now - recent[0] >= self.window:
+                recent.popleft()
+            if len(recent) >= self.limit:
+                return False
+            recent.append(now)
+            return True
+
+
+# Generous for one viewer (a lookup per episode, debounced searches) yet stops scripted abuse
+# of a public API that spends the service's MAL and AniList quota.
+RATE_LIMITS = {'/discussion': RateLimiter(60, 60), '/search': RateLimiter(90, 60)}
+
+
+def client_ip():
+    # Heroku's router appends the connecting address to X-Forwarded-For; earlier entries
+    # come from the client and can be forged, so use the last one.
+    forwarded = [part.strip() for part in request.headers.get('X-Forwarded-For', '').split(',') if part.strip()]
+    return forwarded[-1] if forwarded else (request.remote_addr or 'unknown')
+
+
+@app.before_request
+def apply_rate_limits():
+    limiter = RATE_LIMITS.get(request.path)
+    if request.method == 'POST' and limiter and not limiter.allow(client_ip()):
+        response = jsonify(error='rate_limited', message='Too many requests. Please wait a moment and retry.')
+        response.headers['Retry-After'] = '30'
+        return response, 429
 
 
 def _is_discussion_request():
